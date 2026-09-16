@@ -1,0 +1,18 @@
+# Minimal MediaMTX config for the Camera Agent demo.
+# MediaMTX auto-loads this file when launched from the project root.
+# "all_others" with no source lets the agent publish to any RTSP path
+# (e.g. rtsp://127.0.0.1:8554/camera01) without per-path setup.
+#
+# Latency notes:
+#   MediaMTX is essentially an RTP pass-through, so it adds minimal delay.
+#   We force TCP interleaving (matching the publisher's rtspclientsink, which
+#   already uses TCP) to avoid UDP re-ordering/jitter. Recording stays off so
+#   no disk buffering is introduced. The remaining latency headroom lives on
+#   the subscriber side (ffplay rtspsrc), not here.
+logLevel: info
+paths:
+  all_others:
+    # Force RTSP over TCP (interleaved) for both publisher and subscribers.
+    rtspTransport: tcp
+    # No recording -> no disk buffering in the server path.
+    record: no

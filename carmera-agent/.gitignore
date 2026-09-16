@@ -1,0 +1,10 @@
+
+*.err
+*.log
+*.h264
+capture-*
+auto.crt
+auto.key
+
+build-msvc
+build-msvc-gst

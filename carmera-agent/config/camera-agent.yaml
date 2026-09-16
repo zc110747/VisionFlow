@@ -1,0 +1,64 @@
+# Camera Agent configuration
+# Precedence: CLI arguments > this file > built-in defaults.
+
+camera:
+  id: 0
+  width: 1280
+  height: 720
+  fps: 30
+
+encoder:
+  codec: h264
+  bitrate: 4000          # kbps
+  keyframe_interval: 30  # frames
+
+stream:
+  id: camera01
+
+rtsp:
+  server: 127.0.0.1
+  port: 8554
+
+device_id: camera01
+log_level: info
+
+# ---- AI branch (independent of the video pipeline) ------------------------
+# The AI branch taps the video frames with a GStreamer `tee`; it never sits in
+# the video path. If the model cannot be loaded the video stream keeps running
+# and only AI results are missing.
+ai:
+  enable: false                 # true: run person detection + tracking
+  fps: 8                        # inference rate, configurable range 5-12 (ignored when source fps < full_rate_below_fps)
+  confidence: 0.5               # detection + tracker gate
+  # YOLO11 detection (default) or pose model - both are auto-detected:
+  #   models/yolo11n.onnx       person detection (COCO, class 0 = person)
+  #   models/yolo11n-pose.onnx  adds 17 body keypoints per person
+  model: models/yolo11n.onnx    # relative paths are resolved from the working directory
+  input_width: 640
+  input_height: 640
+  queue_size: 2                 # bounded frame queue; oldest frame dropped on overflow
+  nms_threshold: 0.45
+  match_threshold: 0.8          # ByteTrack IoU gate, first association
+  track_buffer: 30              # lost-track lifetime in "30fps frames"
+  low_confidence: 0.1           # detector floor; low-score boxes only refresh tracks
+  full_rate_below_fps: 10       # source slower than this -> infer EVERY frame
+  log_objects: true
+  num_threads: 2                # ONNX Runtime intra-op threads
+
+# ---- Metadata upload (Phase 2) --------------------------------------------
+# AI results are encoded as JSON and POSTed by a dedicated thread. Nothing here
+# can affect the video stream: a dead / slow / refusing server only produces
+# WARN logs, and the sender keeps retrying with exponential backoff.
+metadata:
+  enable: false
+  server_url: http://127.0.0.1:8080/api/metadata
+  camera_id: camera01
+  version: 1                    # wire protocol version
+  queue_size: 8                 # bounded; oldest message dropped on overflow
+  timeout_ms: 2000              # per-request timeout
+  retry_interval_ms: 1000       # first retry delay
+  retry_max_interval_ms: 30000  # backoff ceiling
+  heartbeat_interval_sec: 10    # status message period; 0 disables it
+  log_payload: false            # dump full JSON at DEBUG level
+  insecure: false               # https only: relax cert check for a self-signed DEV server. NEVER in production.
+

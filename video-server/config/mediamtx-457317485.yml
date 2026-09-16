@@ -1,0 +1,23 @@
+logLevel: info
+api: true
+apiAddress: 127.0.0.1:9997
+rtsp: true
+rtspAddress: 0.0.0.0:8554
+rtpAddress: :8000
+rtcpAddress: :8001
+rtmp: false
+srt: false
+moq: false
+webrtc: true
+webrtcAddress: 0.0.0.0:8889
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189
+webrtcIPsFromInterfaces: true
+hls: true
+hlsVariant: mpegts
+hlsAddress: 0.0.0.0:8888
+playback: false
+record: false
+paths:
+  all_others:
+    source: publisher

@@ -1,0 +1,87 @@
+# Video Server configuration for the JOINT run with carmera-agent.
+#
+# Same schema as config.yaml - the only difference is the port block and the
+# database file, so the joint demo never collides with a standalone server
+# (or with other software on this machine) already holding the defaults.
+#
+# Why http_port is 8081 and not 8080:
+#   Port 8080 on this machine is grabbed by "ApplicationWebServer". If it wins
+#   the race, the server cannot bind and the joint run looks broken for no
+#   reason. 8081 is free. If it ever gets taken too, change the number here -
+#   every port lives in this file, none are hardcoded in the source.
+#
+# Ports in use by the joint run:
+#   8081  HTTP      REST API + embedded Web UI       bind 0.0.0.0 (LAN)
+#   8554  RTSP      where camera-agent pushes, and where players pull from
+#   9997  HTTP      MediaMTX control API (polled by the server's monitor)
+#                   bind 127.0.0.1 - internal only, never exposed to the LAN
+#   8889  HTTP      MediaMTX WebRTC (WHEP signaling, proxied by the server)
+#   8888  HTTP      MediaMTX HLS (optional)
+#
+# LAN access: bind is 0.0.0.0, so every IPv4 on this machine serves the same
+# port. The server prints all reachable URLs on startup (also available as
+# GET /api/net/addresses). If another machine cannot connect, allow the ports:
+#   scripts\firewall-add.bat 8081 8554 8889 8888
+
+server:
+  # "auto" advertises the LAN IPv4 inside the RTSP/WebRTC/HLS URLs handed to
+  # clients, so those URLs work from other machines - not just from this box.
+  host: auto
+  http_port: 8081
+  # 0.0.0.0 = one port, every local IPv4. LAN clients open
+  # http://<this-machine-ip>:8081/  Use 127.0.0.1 for local-only.
+  bind: 0.0.0.0
+
+rtsp:
+  port: 8554
+
+webrtc:
+  port: 8889
+
+database:
+  path: data/video.joint.db
+
+mediamtx:
+  # Local dev override: the MediaMTX binary installed on this machine.
+  # On a fresh clone, point this at your own mediamtx(.exe).
+  binary: mediamtx.exe
+  # Runtime generated config (unique temp name inside this directory).
+  config: ./data/mediamtx.yml
+  # Media ports (RTSP/WebRTC/HLS) listen on all interfaces so cameras and
+  # players on the LAN can push and pull.
+  bind: 0.0.0.0
+  # Control API stays loopback-only: only this server polls it. Exposing it
+  # would give the whole LAN full control over every stream.
+  api_bind: 127.0.0.1
+  # WebRTC ICE listeners. TCP is enabled next to UDP on purpose: without it a
+  # phone whose UDP path to this box is blocked gets no ICE candidate pair at
+  # all, which looks like "the page loads but the video never starts".
+  ice_udp_port: 8189
+  ice_tcp_port: 8189
+  # RTP/RTCP UDP receive ports. Exposed here because the defaults (8000/8001)
+  # are shared by every MediaMTX on the box: if a leftover instance still holds
+  # them, the child exits at once with
+  #   "listen udp :8000: bind: Only one usage of each socket address"
+  # and the monitor then reports no cameras at all.
+  rtp_port: 8000
+  rtcp_port: 8001
+  # MediaMTX control API port - the server's monitor polls this to discover
+  # cameras. This is the reason the joint run must NOT start a second
+  # MediaMTX: only this instance exposes the API.
+  api_port: 9997
+  hls_port: 8888
+
+# AI metadata ingest for the joint run. camera-agent is started with
+# --metadata-url http://127.0.0.1:8081/api/metadata by start-joint.bat.
+metadata:
+  enabled: true
+  retention_rows: 2000
+  max_body_bytes: 1048576
+  # Must stay false here: the agent starts pushing metadata as soon as the
+  # stream is up, which is usually BEFORE the monitor's next 3s poll has
+  # registered the camera row.
+  require_known_camera: false
+
+log:
+  level: info
+  # file: data/video-server.log   # optional; logs go to stdout if omitted

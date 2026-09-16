@@ -1,0 +1,30 @@
+﻿============================================================
+ Joint run: video-server + carmera-agent
+ server root: D:\user_project\git\SOC-Agent\001-carmera_rtmp_net\video-server
+ agent  root: D:\user_project\git\SOC-Agent\001-carmera_rtmp_net\carmera-agent
+============================================================
+[OK]    video-server.exe
+[OK]    camera-agent.exe
+[OK]    config\config.joint.yaml
+[OK]    ports: http=8081 rtsp=8554
+[*] Stopping leftovers: video-server / mediamtx / camera-agent
+[OK]    stopped
+[1/3] Starting video-server ...
+[OK]    video-server healthy on :8081
+[AUTO]   camera index auto-picked: 0 - available: 0 1
+[2/3] Starting camera-agent --auto --stream camera01 ...
+       args: --camera 0 --stream camera01 --server 127.0.0.1 --port 8554 --auto 
+[3/3] Waiting for video-server to auto-register camera01 ...
+[OK]    camera01 registered
+
+============================================================
+ Joint run started
+ Web UI      : http://localhost:8081/
+ REST API    : http://localhost:8081/api/cameras
+ RTSP stream : rtsp://127.0.0.1:8554/camera01
+ Camera      : index 0  - negotiated natively via --auto
+ Logs        : D:\user_project\git\SOC-Agent\001-carmera_rtmp_net\video-server\logs\  (video-server.log / agent.log)
+ Verify      : python scripts\verify_joint.py
+ Stop        : scripts\stop-joint.bat
+============================================================
+

@@ -1,0 +1,26 @@
+# Build artifacts
+/video-server
+/video-server.exe
+/vendor/
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# Runtime data
+/data/
+
+# Downloaded toolchain / extracted binaries (kept locally, not committed)
+/.download/
+/tools/
+/.toolchain/
+
+# Local test artifacts
+push_pids.txt
+_go_versions.json
+
+# Python bytecode cache (verify scripts compiled via py_compile)
+scripts/__pycache__/
+
+# Logs
+*.log
