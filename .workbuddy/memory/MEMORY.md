@@ -17,10 +17,14 @@ UVC 采集 → H264 → RTSP 推流 + 端侧 YOLO11 检测/姿态 + ByteTrack + 
    占用、`9997` 被 `vivoSyncService` 占用，默认配置会 bind 失败。→ §1
 2. **配置路径必须带 `config/` 前缀** —— `Load()` 找不到文件会**静默回退默认 8080**，不报错。→ §2
 3. **联合运行只有一个 MediaMTX** —— 不要执行 `carmera-agent\start-camera-agent.bat`。→ §2
-4. **真机联合验收必须指定 `build-msvc-gst` 的 agent** —— `build-msvc` 是 SIM 后端，
-   `connect()` 是 mock 不真推流，`auto-registered FAIL` 是**假故障**。→ §3
+4. **agent 后端看 `--version`/CMakeCache，不看目录名** —— 2026-09-17 更正：本 checkout 的
+   `build-msvc\CMakeCache.txt` 里 `CAMERA_AGENT_BACKEND=gstreamer`，`--version` 打印
+   `Backend : gstreamer`，实测能真推 H264；"`build-msvc`=SIM" 是**旧 checkout 的结论**，
+   动手前先 `camera-agent.exe --version` 核对。→ §3 §6
 5. **判据看 MediaMTX `paths/list` 的 `online=true`**，不要看 `/api/cameras` 有没有该路
    （DB 会复用上一轮）。→ §3
+6. **仓库根 `start.bat` 是联合运行入口**；文件必须 **CRLF**（LF 会 `call :label` 假 FAIL）。
+   本机**无可用 UVC 摄像头**，验证全链路要 `--source videotestsrc`。→ §6
 
 ## 常用命令
 
@@ -31,6 +35,8 @@ video-server\scripts\build.bat                     # 只 server
 carmera-agent\build_oneclick.bat                   # 只 agent（默认 gstreamer 后端）
 
 # 运行
+start.bat                                              # 仓库根：联合运行入口（= start-joint-ai 全功能）
+start.bat --source videotestsrc --no-browser --no-pause --probe   # 无摄像头时的全链路自检
 video-server\scripts\start-joint.bat --ai --metadata    # 联合运行 + 开浏览器
 video-server\scripts\stop-joint.bat
 video-server\start_oneclick.bat                         # 只起服务端
@@ -52,6 +58,7 @@ cd carmera-agent && ctest --test-dir build-msvc --output-on-failure   # 29 个�
 | 验收脚本与实测坑（TCP 推流、后台进程挂起、DB 复用） | §3 |
 | **"视频正常但 AI 不显示"排查顺序** / 二进制过旧判定 | §4 |
 | 9/4 merge 冲突残留事件与教训 | §5 |
+| **根 `start.bat` 用法 + 多摄像头结论 + AI 能力选择缺口（方案 A/B/C）** | §6 |
 
 ## 交付约定
 

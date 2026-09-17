@@ -39,8 +39,11 @@
 - ⚠️ **联合运行只有一个 MediaMTX**：`video-server` 自己拉起且只有它开了控制 API。
   不要执行 `carmera-agent\start-camera-agent.bat`（起第二个实例抢 `:8554`，且没有控制 API，
   服务器看不到那路流）。
-- `start-demo.bat`（早期放在仓库根）**已被 `video-server\scripts\start-joint.bat` 取代**，
-  根目录现已无该文件；旧笔记里提到它不要照做。
+- **仓库根 `start.bat`（2026-09-17 新增）= `video-server\scripts\start-joint-ai.bat` 的全功能副本**，
+  只是把路径基准从 `<repo>\video-server\scripts` 改成 `<repo>`（`REPO=%~dp0` →
+  `ROOT=%REPO%\video-server` → `AGENT_DIR=%REPO%\carmera-agent`）。**新功能：`--probe` /
+  `PROBE=1` 自检；`--no-pause` / `NO_PAUSE=1` 关掉收尾暂停**。详见 §6。
+  早期根目录的 `start-demo.bat` 与本文件**无关**，不要混淆。
 
 ---
 
@@ -93,3 +96,67 @@
   判断"哪侧是已验证基线"看提交时间 + 主题对应，比逐块手工取舍可靠。
 - 修复后回归：`go build/vet/test` 全绿、`gofmt -l` 空、`npm run build` ✓、
   全目录 grep 无 `<<<<<<<` 残留。
+
+---
+
+## §6 仓库根 `start.bat` 与 AI 能力选择（2026-09-17）
+
+### 6.1 启动器
+
+```bash
+start.bat                                   # 与 scripts\start-joint-ai.bat 等价（AI+metadata 默认开）
+start.bat --source videotestsrc --no-browser --no-pause --probe
+```
+- 参数与 `start-joint-ai.bat` 完全一致（`--camera/--stream/--source/--ai-fps/--no-browser/
+  --ai/--no-ai/--metadata/--no-metadata`），**新增** `--probe`（跑 API 自检）、
+  `--no-pause`（收尾不等按键）。环境变量同名可用（`PROBE=1`、`NO_PAUSE=1`）。
+- 文件必须 **CRLF 换行**（LF 会让 `call :label` 间歇失败，见用户级 playbook §4.2）。
+- ⚠️ **本机没有可用 UVC 摄像头**（`camera-agent.exe --list` → `No cameras found.`），
+  验证全链路必须加 `--source videotestsrc`；不加则 agent 一直重连、`camera01` 永不注册。
+- ⚠️ 沙箱会在工具调用返回时**回收 `start ""` 起的子进程**（与 §3 一致）⇒
+  启动器自己打印的 `[OK] ... healthy` / `registered` 与 `--probe` 就是**唯一可信的运行态证据**；
+  不要在调用返回后再去 curl。`--probe` 正是为此加的（13 项 PASS）。
+
+### 6.2 多摄像头结论：**架构上支持，链路已通**
+
+| 环节 | 证据 |
+|---|---|
+| MediaMTX 动态收流 | `manager.go` 生成 `paths: all_others: source: publisher`，无静态 path 表 |
+| 自动注册 | `monitor.go` 轮询 `paths/list?itemsPerPage=1000`，凡 `HasSource` 的 path 各建一行 |
+| 表结构 | `cameras.stream_path UNIQUE`；`ai_frame/ai_object/ai_status/ai_aimode` 全部以 `camera_id` 为主键 |
+| 前端 | `HomeView` 逐张 `CameraCard`；`CameraView/VideoPlayer` 按 `{id}` 实例化，各自持有 aiMode 与 metadata 轮询 |
+| 身份映射 | `resolveCamera()` 先按 id、再按 `stream_path` 解析 agent 的 `metadata.camera_id` |
+
+⇒ **N 个 agent 只要各自用不同的 `--stream` + 对应 `--metadata-camera-id` 就能并存。**
+注意事项：① 两个 agent 都默认 `camera01`，会互抢同一 path；② `--auto` 的相机索引自动挑选
+**取第一个** ⇒ 同机双 agent 必须显式 `--camera 0/1`；③ 三者共用同一个 MediaMTX `:8554`；
+④ `verify_joint.py --stream` 默认 `camera01`，多路要逐路跑；⑤ 启动器只起 **1 个** agent
+（多路要手工再起 N-1 个，或后续加 `--agents` 循环）。
+
+### 6.3 AI 能力选择：**当前不支持，UI 是个"哑控件"**
+
+服务端**没有任何能力/协商概念**，UI 恒显示 3 个按钮且从不置灰：
+
+1. `Camera` 结构无 ai/capabilities 字段；只有 `ai_status` 心跳里的
+   `ai_enable/ai_running/model/keypoint_count`（且只存最新一行，agent 掉线不清）。
+2. `VideoPlayer.vue` 的 `aiModeOptions` 是硬编码三条，模板里**没有 `:disabled`**——
+   而 CSS 里 `.mode-btn:disabled` 样式早就写好了 ⇒ 禁用态当初预留但没接上。
+3. `GET /api/cameras/{id}/aimode` 无记录时**无条件返回 `ai-y`**（`DefaultAIMode`），
+   即使该 agent 根本没跑 AI、甚至没连上 ⇒ UI 显示"人检测"为激活态，误导。
+4. **静默死控件**：agent 的 aimode 轮询线程只在 `cfg_.ai.enable` 为真时启动
+   （`stream_controller.cpp` `start_ai()` 早退）⇒ 后端不带 AI 时 UI 切模式 POST 得 200，
+   但没有任何一方会响应。
+5. `metadata.enabled:false` 时也不灰：`main.go` 总是构造非 nil 的 meta repo，
+   `aimode` 的 `h.meta == nil` 分支永不触发，只有 `ingest` 会 503。
+6. 盲区：agent 用 `--no-metadata` 时服务端**零信号**，无法区分"没 AI"与"没上报"。
+
+**方案 A（纯服务端推断，改动最小，推荐先做）**：由心跳三态判能力 ——
+`enable && running` → 支持（`model` 名含 `pose` 才放开 ai-y-pose，即
+`keypoint_count>0`）；`enable && !running` → "想要但起不来"（无 AI 编译/模型缺失）→ 置灰；
+无心跳或心跳超时（如 >30s）→ **unknown，按 fail-closed 全灰**。
+覆盖"后端不带 AI"与"metadata 关掉"两种，唯独 `--no-metadata` 仍盲。
+**方案 B（显式能力上报，最干净）**：status 心跳加 `capabilities{ai,modes,keypoint_count}`，
+服务端持久化新列并在 `/api/cameras/{id}` 暴露；UI 按 `modes` 渲染。
+需要同时改 agent（`metadata_encoder` / `AIStatusInfo`）+ server（repo/handlers）+ web。
+**方案 C（握手注册）**：agent 启动 POST `/capabilities`，`POST aimode` 对不支持的模式回 409。
+必备共同项：`POST /aimode` 对不支持的模式返回 4xx（而不是静默 200）+ UI 默认置灰。
