@@ -573,6 +573,11 @@ scripts\test-stream.bat camera01
 | `POST /api/metadata` | 接收 camera-agent 的 AI 结果（`frame` / `status`），成功一律 `204` |
 | `GET /api/metadata` | 全局概览：`{"enabled","cameras":[{camera_id, frame, status}]}` |
 | `GET /api/cameras/{id}/metadata` | 单路快照：`{"camera_id","frame":{...},"status":{...}}` |
+| `GET /api/cameras/{id}/aimode` | 该路的目标 AI 模式（未设置时返回默认 `ai-y`） |
+| `POST /api/cameras/{id}/aimode` | 设置目标模式。白名单：`ai-off` / `ai-y` / `ai-y-pose` / `ai-hand`；其余 → `400` |
+| `GET /api/cameras/{id}/hand/sessions` | hand 录制器会话列表；`?gap_ms=N` 覆盖切分间隔（非法 → `400`，未知相机 → `404`） |
+| `GET /api/cameras/{id}/hand/sessions/{index}` | 下载单个会话，`Content-Disposition` 给出 `hand_session_<cam>_<n>.json` |
+| `DELETE /api/cameras/{id}/hand/log` | 清空该路 hand 录制器，返回 `{"camera_id","cleared"}` |
 
 摄像头自动注册由 monitor 驱动：RTSP 推流者连上 MediaMTX 后，`all_others.source: publisher` 会自动创建路径，monitor 检测到 `HasSource` 即按 `stream_path` upsert 为摄像头（`online`/`offline` 由 `Ready` 决定；10s 无数据置 `offline`）。
 
@@ -588,7 +593,7 @@ camera-agent 的 AI 分支把检测结果异步 POST 到服务端，与视频流
 
 | `type` | 含义 | 频率 | 落表 |
 |---|---|---|---|
-| `frame` | 一次推理结果：帧号 + 检测框 | 默认 5/s | `ai_frame` + `ai_object` |
+| `frame` | 一次推理结果：帧号 + 检测框（`ai-hand` 帧另带 `hand` 块） | 默认 5/s（hand 模式 8/s） | `ai_frame` + `ai_object`（+ `ai_hand_log`） |
 | `status` | AI 存活心跳 + 模型身份 | 默认 10s | `ai_status` |
 
 ```jsonc
@@ -605,13 +610,14 @@ camera-agent 的 AI 分支把检测结果异步 POST 到服务端，与视频流
 
 **铁律（与 agent 侧一致）**：`frame_id`（摄像头帧计数）与 `timestamp`（采集端 PTS，ms）由**采集侧**产生，服务端**原样存储**，绝不重编号或"修正"。`bbox` 是原始像素 `[x1,y1,x2,y2]`。
 
-### 10.2 三张表
+### 10.2 四张表
 
 | 表 | 粒度 | 说明 |
 |---|---|---|
 | `ai_status` | 每路一行 | 最新心跳（`ai_enable`/`ai_running`/`ai_fps`/`model`/`tracker`/`processed`） |
-| `ai_frame` | 每路一行 | **最新一帧**的帧号、时间戳、分辨率、目标数 |
+| `ai_frame` | 每路一行 | **最新一帧**的帧号、时间戳、分辨率、目标数；`ai-hand` 帧另存 `hand`（JSON 文本） |
 | `ai_object` | 每条目标一行 | 检测明细（`class`/`confidence`/`track_id`/`bbox`），带滚动裁剪 |
+| `ai_hand_log` | 每帧一行 | **append-only 手部录制器**：`detected`/`gesture`/`payload`（agent 原文），带滚动裁剪。见 §10.8 |
 
 `ai_frame` 只留最新帧：监控场景关心"现在画面里有什么"，历史帧由上层日志负责。`ai_object` 按 `retention_rows` 滚动裁剪（默认每路 2000 条），不是每写一次就 DELETE —— 而是每 64 次保存触发一次批量裁剪，避免高频写入被 DELETE 拖慢。
 
@@ -623,6 +629,11 @@ metadata:
   retention_rows: 2000       # 每路保留的检测明细条数，0 = 不裁剪
   max_body_bytes: 1048576    # 单包上限，超出 → 413（decode 之前就拒，不缓冲）
   require_known_camera: false # true = 只接受已在 cameras 表登记的路
+  # ---- hand 录制器（ai-hand 帧，见 §10.8）----
+  hand_log_max_rows: 100000  # ai_hand_log 每路行数上限，最旧先剪。<= 0 关掉录制器
+  hand_log_prune_every: 256  # 每多少次追加剪一次（每帧都剪等于每帧多一次写事务）
+  hand_log_detected_only: false # true = 只记 detected=true 的帧；默认 false 保无损
+  hand_session_gap_ms: 1000  # 会话切分间隔（agent 时钟 ms），导出时可 ?gap_ms= 覆盖
 ```
 
 `require_known_camera` 联合运行时**必须为 `false`**：agent 一流起来就开始推 metadata，通常早于 monitor 下一次 3s 轮询把摄像头登记进 `cameras` 表。置 `true` 会让 agent 白退避一轮。
@@ -633,6 +644,8 @@ agent 已经 clamped，服务端仍然再夹一次：
 
 - `bbox` 先修正 `lo > hi`（反向框），再夹进 `[0, width] × [0, height]`，并保证 `x2 >= x1+1`（退化框会被撑开成 1×1，而不是丢弃）
 - `confidence` 夹到 `[0,1]`
+- `hand.confidence` / `hand.gesture_confidence` 同样夹到 `[0,1]`；`landmarks` **长度不是 21 就整段丢弃**（该数组按 MediaPipe 关节表定位，长度不对意味着"换了含义"而不是"差一点"），帧的其余部分保留
+- `hand` 里的枚举 token（`gesture` / `handedness` / `motion.*`）**故意不校验**，原样存储 —— 后续 agent 新增手势时不需要服务端跟着发版
 - `frame` 缺 `camera_id` 或宽高非正 → `400`
 - 坏消息**绝不覆盖好数据**（验收脚本用 `frame_id` 前后比对锁定）
 - 视频流路径完全不受影响：metadata 写失败不会反映到 `/api/health`
@@ -673,6 +686,37 @@ curl -s http://127.0.0.1:8081/api/cameras/camera01/metadata | python -m json.too
 # 全局概览
 curl -s http://127.0.0.1:8081/api/metadata | python -m json.tool
 ```
+
+### 10.8 手部录制器（`ai-hand` 帧）
+
+设计目标只有一个：让一次标定 / 轴向实验能**离线重放**。所以宁可多存，不可丢字段。
+
+- **append-only、常开**：每个 `ai-hand` 帧直接追加进 `ai_hand_log`，不需要"开始录制"开关（除非把 `hand_log_detected_only` 打开）。
+- **原字节保真**：`payload` 存的是 agent 发来的那个 JSON 对象**原样** —— `HandState` 解码时留存原始字节，写库时直接落，**不重新序列化**。后续 agent 新增字段，服务端不认识也不会丢。这条性质可被数据自证：库里 `position` 是 `[0.0000,0.0000,0.0000]` 这种定点格式，而 Go 重新编码会写成 `[0,0,0]`。
+- **与最新帧同事务**：`ai_frame.hand` 与 `ai_hand_log` 的追加在同一事务里提交，"网页看到了但日志没有"不会发生。
+- **会话切分**（两条**独立**判据）：
+  1. `detected == false` 的行**无条件**结束当前会话 —— 那是"手离开画面"的签名；
+  2. 相邻两行的 **agent 时钟**（PTS ms）间隔 > `gap_ms` 才切分。
+
+  任何 gap 都**跨不过**第 1 条：否则"握住 → 松开 → 再握"会被合并成一次动作。第 2 条用 agent 时钟而不是服务端 `received_at`，因为网络抖动会让重发的 POST 看起来像"手走开又回来"。
+- **导出**：`GET /hand/sessions/{index}` 返回一个自包含文件（`version` / `camera_id` / `exported_at` / `gap_ms` / `session` 摘要 / `frames[]` 含 payload），浏览器直接存成 `hand_session_<cam>_<n>.json`。
+- **容量**：默认每路 10 万行（8 fps 下约 3.5 小时），最旧先剪；标定前用 `DELETE /hand/log` 清干净比"靠容量滚掉"可靠。
+
+```bash
+# 会话列表（gap 取配置默认 1000ms）
+curl -s http://127.0.0.1:8081/api/cameras/camera01/hand/sessions | python -m json.tool
+
+# 换个 gap 再看：切分是"分析"而不是"录制"，同一份日志可以给出不同答案
+curl -s "http://127.0.0.1:8081/api/cameras/camera01/hand/sessions?gap_ms=10000" | python -m json.tool
+
+# 下载第 2 个会话（-OJ 按 Content-Disposition 存成 hand_session_camera01_2.json）
+curl -OJ http://127.0.0.1:8081/api/cameras/camera01/hand/sessions/2
+
+# 标定前清空
+curl -s -X DELETE http://127.0.0.1:8081/api/cameras/camera01/hand/log
+```
+
+实现落点：`internal/metadata/repo.go`（表 / 落库 / 切分）、`internal/metadata/model.go`（`HandState` 与校验）、`internal/api/hand.go`（三个端点）。
 
 未知摄像头返回**空快照**而非 404（`frame`/`status` 为 `null`），这样前端轮询不必区分"没数据"和"没这路"。
 

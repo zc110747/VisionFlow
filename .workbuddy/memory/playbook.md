@@ -24,9 +24,11 @@
 - 工具路径（脚本内自动探测，**不要硬编码**）：
   `mediamtx` = `D:\data\agent-tools\mediamtx_v1.20.1_windows_amd64`；
   `ffmpeg/ffprobe` = `D:\data\agent-tools\ffmpeg-master-latest-win64-gpl-shared\bin`。
-- 真机摄像头：`LRCP USB2.0`（1280×720@30）。
+- 真机摄像头：`LRCP USB2.0`（`VID_0C45&PID_6366`，1280×720@30）。
   ⚠️ `--list` 会把它列成 **两条**（同一台设备枚举两次），**只有 `--camera 0` 能真正上流**，
   `--camera 1` 报 `Failed to start`。枚举用 `camera-agent --list`，可用性必须实跑确认。
+  ⚠️ **该模组画面被滚转 90°**（真实世界的"上"指向画面**左侧**）。修正 =
+  **顺时针 90°**（`videoflip video-direction=90r`）。取证与影响面见架构文档 §12。
 
 ---
 
@@ -168,7 +170,7 @@ start.bat --source videotestsrc --no-browser --no-pause --probe
 
 ---
 
-## §7 手部 3D 识别分支（2026-09-23，P1a–P1e 已提交 `5eeee73` / `b6edeb3` / `e9e8b8c`）
+## §7 手部 3D 识别分支（2026-09-23，P1a–P1e 已提交 `5eeee73` / `b6edeb3` / `e9e8b8c` / `c241b5e` / `93e53b1`；P2 见 §7.6）
 
 ### 7.1 模型与几何（**改这些数字前先读 `carmera-agent/models/README.md`**）
 
@@ -243,3 +245,59 @@ ratio ⇒ **报文本身就够标定，不用改代码不用重编**。脚本
    是 `sort -V` 被 System32 遮蔽（脚本已修，优先 `/usr/bin/sort`）。
 6. `tasklist //FI "IMAGENAME eq x.exe"` **静默返回空**（System32 垫片接管）——
    要判"还有没有进程"只能用 `tasklist | grep -i x`。
+7. **抓帧取证必须用「与产品同款」的采集路径。** 用 `ffmpeg -f dshow` 抓的帧，
+   不等于 agent（`mfvideosrc` / Media Foundation）看到的帧 —— MF 会应用 UVC 的 roll 属性。
+   凡涉及"设备到底输出什么"，判据要么来自同款链路，要么**两条路径互相印证**。
+8. **涉及坐标系的结论不能靠"看着对"。** 第一遍肉眼判画面朝向得出了自相矛盾的两条线索。
+   正确做法：把**所有候选解都渲染出来做排除**（±90° 两种都做，看哪种人脸正立）。
+   这次的定案依据是「放大裁脸看发际朝哪」+「逆时针版人头朝下」。
+
+### 7.5 画面朝向：摄像头滚转 90°（2026-09-23 **已解决：物理转回，零代码**）
+
+**结论**：真实世界的"上"指向画面**左侧** ⇒ 侧躺 = 顺时针 90° 装反。用户把本体转回后
+实测正立（同款源 `mfvideosrc` 抓帧判读：天花板在上、眼镜水平、置物架在左，仍 1280×720）。
+**方案 A（软件旋转）不采用，但已现场验证可用，留作备选**：
+
+| 项 | 值 |
+|---|---|
+| GStreamer | `videoflip video-direction=90r`（`method=clockwise` 已 deprecated） |
+| ffmpeg | `transpose=1` |
+| 实测输出 | 1280×720 **→ 720×1280**（竖幅），这才是当初不想走 A 的代价之一 |
+| 插入位置 | **caps 之后、`tee` 之前**（放 tee 之后只有 AI 分支被转 → overlay 错位） |
+
+**为什么当初必须修**（现在已由物理转回解除）：`hand_map_coordinates()` 硬假设画面正立
+（`x=cx/fw`、`z=(fh-cy)/fh`），只有 `invert_x/y/z` 三个**符号翻转** —— 90° 滚转是
+**轴对调**，符号翻转折不出来；侧躺时 hand 的 logical X 实际测的是**竖直**方向。
+⚠️ `invert_*` 的**取值**仍未实验确定（§16），但现在只是"符号选哪个"，不是"轴对调"。
+
+**⚠️ 排查朝向时的坑（本轮踩过）**
+
+1. **别用 `ffmpeg -f dshow` 抓帧去推设备行为** —— agent 走的是 `mfvideosrc`
+   （Media Foundation），MF 会应用 UVC 的 roll 属性，两条路径可能不一致。
+   判据必须取自**与产品同款的那条链路**。
+2. **别靠单一线索肉眼判"上在哪"** —— 我先按"灯板在左"判一次、又按"脸的朝向"判一次，
+   两次**互相矛盾**。可靠线索是**上下不对称且无歧义**的目标（文字、眼镜、发际线），
+   必要时裁近放大再看。"亮斑在哪"只能说明光源位置。
+
+### 7.6 P2 服务端 hand 落库（2026-09-23 完成）
+
+**接口**（`internal/api/hand.go`）：`GET /hand/sessions[?gap_ms=N]`、
+`GET /hand/sessions/{index}`（下载 `hand_session_<cam>_<n>.json`）、`DELETE /hand/log`。
+未知相机 → **404**（不是"0 个会话"，否则打错 id 看起来像"录制器正常但空"）。
+
+**两条设计决定（都有实测依据）**
+
+1. **payload 存 agent 原字节**，不重新序列化 —— 库里 `position` 是 `[0.0000,...]`
+   这种 C++ 定点格式，Go 重编码会写 `[0,...]`。这就是"服务端不改写生产者数据"的**可验证据**。
+2. **会话切分是两条独立判据**：`detected=false` **无条件**结束会话；
+   `gap_ms` 只管"全是 detected 的行之间隔了多久"（录制器漏采 / `detected_only`）。
+   **任何 gap 都跨不过"手离开画面"** —— 否则"握住→松开→再握"会被合并成一次动作。
+   切分用 agent 时钟（PTS）而非 `received_at`：网络抖动会让重发的 POST 看起来像"手走开又回来"。
+
+**落库纪律**：`ai_frame.hand` 与 `ai_hand_log` 追加**同事务**（避免"网页看到了但日志没有"）；
+`hand_log_max_rows <= 0` 关录制器但**最新帧照样写**（前端不依赖历史）；
+裁剪在事务**之外**做（剪失败只多占空间，绝不导致 ingest 失败）。
+
+**⚠️ 联合运行下跑 hand 的硬前提**：`ValidAIMode` 必须收 `ai-hand`。
+否则 agent 的 aimode 轮询器读回 `ai-y`，**1 秒内把 agent 从 hand 拽回 detect** ——
+症状是"agent 日志明明打印了 `mode=hand` 却立刻变成 detect"，很容易误判成 agent 的 bug。

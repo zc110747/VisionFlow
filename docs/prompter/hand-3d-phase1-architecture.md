@@ -177,7 +177,7 @@ camera ──tee──┬──► video pipeline ──────────
 | **P1c** | `HandAnalyzer`：坐标映射 / EMA / reference / deadzone / motion / gesture 去抖 | 13 个无模型单测全绿 | ✅ 完成并提交 |
 | **P1d** | 接线：`AIMode::Hand` + `hand` metadata 编码 + config/CLI | 双构零警告 | ✅ 完成并提交 |
 | **P1e** | P1 验收：真机 720p@30 出 `ai-hand` 帧 + 定 `kCurledRatio` | 全链路真机跑通（需举手配合） | ✅ 完成（见 §11） |
-| **P2** | server：schema 增量列 + `hand` 解码/校验 + append-only `ai_hand_log` 录制器 + `hand_session_*.json` 导出 + `ai-hand` 放行 | `go test ./...` 全绿 + 真机 metadata 落库 | 待开始 |
+| **P2** | server：schema 增量列 + `hand` 解码/校验 + append-only `ai_hand_log` 录制器 + `hand_session_*.json` 导出 + `ai-hand` 放行 | `go test ./...` 全绿 + 真机 metadata 落库 | ✅ 实现完成（见 §13） |
 | **P3** | 前端：21 点手部骨架 overlay + HUD + `HandPanel` 调试面板 + `ai-hand` 按钮（只消费 metadata） | 构建零错误 + 无头渲染断言 | 待开始 |
 | **P4** | 端到端：`verify_hand.py`（PASS/FAIL 计数）+ §16 坐标方向实验记录 + README | 全链路真机跑通 | 待开始 |
 
@@ -391,9 +391,209 @@ gesture_candidate: FIST 23 / OPEN_PALM 8
 
 ### 11.5 仍未验证
 
-- `depth_source` 的方向（哪个符号是"靠近"）与真实 UVC 的 `invert_*` 取值。
-- **画面疑似整体旋转 90°**：真机帧里天花板灯板出现在**画面左侧**、玻璃隔断在右侧，
-  即场景的"上"沿画面水平轴。这直接关系到 §17 的 logical 坐标系
-  （X+ 右 / Y+ 前 / Z+ 上）能否成立，也决定 P3 前端 overlay 的朝向 —— 需确认是物理安装
-  还是画面本身如此，**在 P3 动工前必须解决**。
+- `depth_source` 的方向（哪个符号是"靠近"）与真实 UVC 的 `invert_*` 取值
+  —— 注意：这只是**符号选取**问题，不是 12.5 那种"轴对调"级别的语义错误。
+- ~~画面疑似整体旋转 90°~~ → **已解决**：确认为滚转 90°，用户**物理转回本体**后实测正立，
+  零代码改动。取证、两个方案的取舍与排除项见 §12。
+
+---
+
+## 12. 画面朝向实证：摄像头滚转 90°（2026-09-23 定案）
+
+### 12.1 结论
+
+**采集画面被滚转 90°，修正方向 = 顺时针 90°**
+（GStreamer：`videoflip video-direction=90r`；ffmpeg：`transpose=1`）。
+
+原始帧里**真实世界的"上"指向画面左侧**。顺时针旋转后画面正立：
+天花板灯板与格栅在上、人发际在上且眼镜水平、笔记本边框在下（已现场验证，见 §12.4）。
+
+### 12.2 为什么不能靠"看着像"定案
+
+第一遍肉眼判读给出了**互相矛盾**的两个线索：天花板灯板/格栅在画面**左侧**（⇒ 上是左），
+但人脸的朝向又像"上是右"。原因是 raw 帧里人脸只有约 150 px 高、而且整体侧躺，
+那个尺度上肉眼判"上下"不可靠 —— 我第一遍就读错了。
+
+于是改用两条**客观**线索：
+
+1. **放大裁切人脸**（`crop=700:460:350:120` 后再 2× 最近邻）→ 发际在**左**、下巴在**右**
+   ⇒ 上是左，与灯板线索一致；
+2. **两种旋转都做出来复查**：顺时针 90° 得正立人脸；逆时针 90° 人头朝下 ⇒ 排除。
+
+> 教训：涉及坐标系的结论，**不要用"看着对"作判据**，要把候选解都渲染出来做排除。
+
+### 12.3 关键排除项：DirectShow ≠ Media Foundation
+
+`ffmpeg -f dshow` 与 agent 实际使用的 `mfvideosrc` 是**两条不同的采集路径**，
+MF 会应用 UVC 的 roll 属性而 DirectShow 不一定。如果只抓 dshow 就下结论，
+有可能测的是"另一条路径的行为"。所以取证必须用 **agent 同款源**：
+
+```bash
+gst-launch-1.0 -q mfvideosrc device-index=0 num-buffers=40 \
+  ! queue ! videoconvert ! video/x-raw,width=1280,height=720,framerate=30/1 \
+  ! videoconvert ! pngenc ! multifilesink location=frame_%02d.png
+```
+
+两条路径结论一致（都侧躺）⇒ 不是 DirectShow 独有现象，是**传感器/安装**的朝向问题。
+
+### 12.4 修法已现场验证
+
+`videoflip` 存在于本机 GStreamer（`videofilter` 插件），且**首选属性是 `video-direction`**，
+`method` 已标记 deprecated：
+
+| 属性 | 值 | 含义 |
+|---|---|---|
+| `video-direction` | `90r` | 顺时针旋转 90°（**本项目要用这个**） |
+| `video-direction` | `90l` | 逆时针 90°（实测人头朝下，排除） |
+| `method`（deprecated） | `clockwise` | 等价于 `90r` |
+
+实测管线与输出：
+
+```
+mfvideosrc device-index=0 ! queue ! videoconvert
+  ! video/x-raw,width=1280,height=720,framerate=30/1
+  ! videoflip name=orient video-direction=90r
+  ! videoconvert ! pngenc ! multifilesink      ⇒ 输出 720x1280，画面正立 ✅
+```
+
+> ⚠️ **位置约束**：`videoflip` 必须放在 **caps 之后、`tee` 之前**。
+> 放在 `tee` 之后只有 AI 分支被转、视频流不转，前端 overlay 会与视频错位；
+> 放在 caps 之前会让 caps 过滤器（1280×720）与翻转输出（720×1280）冲突。
+
+### 12.5 影响面（**选方案 B 后已全部消解**）
+
+| 项 | 若走方案 A（软件旋转）会怎样 | 实际（方案 B 物理转回） |
+|---|---|---|
+| §17 logical 坐标系 | `hand_map_coordinates()` **硬假设画面正立**（`x=cx/fw` → X+ 右；`z=(fh-cy)/fh` → Z+ 上），只有 `invert_x/y/z` 三个**符号翻转**。90° 滚转是**轴对调**，符号翻转折不出来 ⇒ 侧躺时 hand 的 logical X 实际测的是**竖直**方向 | **前提恢复成立**：画面已正立，X/Z 的语义回到设计意图。`invert_*` 的**取值**仍需按 §16 实验定，但不再是"轴对调"级别的错误 |
+| P3 overlay | `landmarks` 是图像像素坐标，叠在侧躺视频上仍能对齐，但骨架朝向与用户直觉相反 | **无需任何旋转补偿**，像素坐标直接可用 |
+| 视频流本身 | 输出变 720×1280 竖幅，`video_width/height` 报文口径要跟着改，`videoflip` 须卡在 caps 之后 / `tee` 之前 | **编码分辨率仍是 1280×720 横幅**，报文口径、`--probe` 读摄像头源 pad 的口径、MediaMTX 协商全部不变 |
+| 代码改动 | 首次给视频管线引入 flip 元素 + 新配置项 + 探针口径修正 | **零代码改动** |
+
+### 12.6 修法定案：方案 B 物理转回（**已实测通过，2026-09-23**）
+
+用户把摄像头本体转 90° 装回后，用**与 agent 同款源**（`mfvideosrc device-index=0`，
+1280×720@30）重抓判读：
+
+- 画面**完全正立**：天花板/灯板在上、人脸直立（发际在上、眼镜水平、下巴在下）、
+  置物架在左，1280×720 横幅。
+- §12.6 表里那条风险（**该模组是否传感器在 PCB 上就已转 90°**，若是则转本体后依旧侧躺）
+  **没有发生**：转本体确实修正了画面。
+
+| 方案 | 决定 | 备注 |
+|---|---|---|
+| **A 软件旋转** | **不采用**（保留为已现场验证的备选） | 元素/属性已实测：`videoflip video-direction=90r`（顺时针，输出 720×1280）。若以后换机位又遇到同类问题（RK3568 侧同理），这是现成的修法，届时再看要不要做成配置项 |
+| **B 物理转回** | ✅ **采用** | 已验证：正立、零代码、无坐标口径变更 |
+
+> 之所以先验证再定案：方案 B 的风险是"看着像机械问题、实际是传感器朝向问题"，
+> 一旦如此，转本体等于白干。实测排除了这一条。
+
+### 12.7 取证纪律（本轮修正的一条方法论）
+
+**"抓一帧看看"必须交代清楚是哪条采集路径抓的。** 本轮先用了 DirectShow，
+差点把一条路径的行为当成设备的行为。凡涉及"设备到底输出什么"，
+判据必须来自**与产品同款的那条链路**（这里是 `mfvideosrc`），
+或至少两条路径互相印证。
+
+第二条：**朝向这类整体几何结论，不要靠单一线索的肉眼判读。** 本轮我先按
+"灯板在左 ⇒ 上是左"判了一次，又按"脸的朝向"判了一次，两次**互相矛盾**；
+最后是把人像区域裁出来放大、以**文字/眼镜/发际线**这类客观线索才定死的。
+判读方向时，先找一个"上下不对称且无歧义"的目标（文字、人脸、书本），
+不要用"亮斑在哪"这种只能说明光源位置的线索。
+
+---
+
+## 13. P2 实证记录：服务端 hand 落库与导出（2026-09-23）
+
+### 13.1 验收数字（原始）
+
+```
+gofmt -l internal/ cmd/      → 无输出（干净）
+go vet ./...                 → 无输出（干净）
+go test ./...                → 61 PASS / 0 FAIL   （P2 新增 19 个用例）
+```
+
+真机（`start.bat --ai --ai-mode hand`，重编后 `video-server.exe` 13:18:22）：
+
+| 检查 | 实测 |
+|---|---|
+| `POST /api/cameras/camera01/aimode {"mode":"ai-hand"}` | **HTTP 200**（改动前 **400**） |
+| agent 侧 | `[AI] model switched -> mode=hand`；此后稳定 `mode=hand fps=8.0 infer=12.2~14.4ms`，`sent=1420 failed=0 dropped=0 reconnect=0` |
+| `ai_hand_log` | **387 行**，`frame_id 176..6369` 区间内的 4922..6369，`detected=0` ×387（镜头前当前无人举手） |
+| `ai_frame.hand` | `ai_mode='ai-hand'`，hand 块 327 B |
+| `GET /hand/sessions` | `total_rows=176→387`、`gap_ms=1000`、0 会话 —— 与"全部 detected=false"一致 |
+
+schema（在老库上确认，`addColumnIfMissing` 生效）：
+
+```
+ai_frame     + hand TEXT                       （增量列）
+ai_hand_log  id, camera_id, frame_id, timestamp,
+             detected, gesture, payload, received_at
+```
+
+### 13.2 "放行 `ai-hand`"是硬前提，不是锦上添花
+
+实测过的因果链：agent 带 `--ai-mode hand` 启动 → `[HAND] ready: ... mode=hand(21kpt)` →
+**1 秒后** `[AI] model switched -> mode=detect (models/yolo11n.onnx)`。
+
+原因是 agent 的 aimode 轮询器读服务端存的模式，而 DB 里是 `ai-y`，且
+`ValidAIMode()` 当时拒收 `ai-hand` —— 于是**服务端拒绝存储 → 轮询器把 agent 拽回 ai-y**，
+联合运行下 hand 模式**根本不可能**稳定下来。这就是 P2 把"放行"排在最前面的原因。
+
+### 13.3 保真落库：为什么存原字节而不是重新序列化
+
+`HandState.MarshalJSON` 返回 **agent 自己的字节**（解码时原样留存），
+录制器再把它整段写进 `payload`。这条性质**可被数据自证**：库里取出的 payload 是
+
+```json
+"confidence":0.00, ... "position":[0.0000,0.0000,0.0000], ...
+```
+
+—— 定点两位小数是 **C++ 编码器的格式**；Go 若重新编码会写成 `0` / `[0,0,0]`。
+所以"服务端不改写生产者数据"不是设计声明，是**能验的**。
+
+代价：`ai_frame.hand` 与 `ai_hand_log.payload` 两份字节都存。前者供 Web 读最新状态，
+后者供离线重放（标定、轴向实验），两者用途不同，且都不大（327 B/帧）。
+
+### 13.4 会话切分的两条判据是独立的（**本轮踩到的一个测试预期错误**）
+
+`splitHandSessions` 的规则是：
+
+1. `detected == false` 的行 **无条件**结束当前会话；
+2. 相邻两行的 **agent 时钟**（PTS ms，非服务端 `received_at`）间隔 > `gap_ms` 才切分。
+
+我最初的 API 用例把预期写成"`gap_ms=10000` 应把两段 hold 合成 1 个会话"，
+**是错的**：那两段之间夹着一帧 `detected=false`，gap 根本没机会生效。
+`gap` 管的是"**全是 detected 的行**之间隔了多久"（录制器漏采 / `detected_only` 模式），
+它**跨不过**"手离开画面"这条事实；否则分析会把用户明明放下手的两次动作合并成一次。
+
+测试已改成在 gap 真正生效的场景下测它（两段 hold 之间**没有任何行**），
+并把这条不变式钉进纯函数测试表（`no gap merges across a loss`）。
+
+### 13.5 错误分支真机核对
+
+| 请求 | 期望 | 实测 |
+|---|---|---|
+| `?gap_ms=abc` | 400 | ✅ 400 |
+| `?gap_ms=0` | 400 | ✅ 400 |
+| 未知相机 | 404 | ✅ 404 |
+| 不存在的会话号 | 404 | ✅ 404 |
+| `/hand/sessions/abc` | 400 | ✅ 400 |
+
+未知相机给 **404 而不是"0 个会话"**：后者会让"相机 id 打错"看起来像"录制器正常但空"。
+
+### 13.6 前端在本阶段**故意不动**
+
+`web/src` 的模式列表（`AI_MODES`）不含 `ai-hand`，而使用点是
+`if (AI_MODES.includes(r.mode))` —— 未知模式被**忽略**而非抛错。所以服务端先放行
+`ai-hand` 不会让现有页面坏掉；"手势"按钮与骨架 overlay 留到 P3。
+
+### 13.7 仍未验证 / 待补
+
+- **真机 `detected=true` 帧的会话与导出实证**（需举手配合）：要验的是 21 点
+  `landmarks` 数组原样过库、按 `gap_ms` 切出来的会话能在导出文件里带全 payload。
+  单测已覆盖（`TestHandSessionsSplitAndExport` 走的是真实 ingest 路由），但**真实 agent
+  产出的大数组**还没进过库。
+- `ai_hand_log` 的容量上界只在单测里验过（cap=5 剪到 5 行、最旧先剪）；
+  真机默认 cap=100000 到不了，暂无法触发。
+
 
