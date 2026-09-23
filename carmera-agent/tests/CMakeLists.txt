@@ -2,6 +2,7 @@
 # headlessly on any machine (no camera / no GStreamer required).
 set(TEST_SOURCES
   run_all.cpp
+  stb_image_impl.cpp
   backoff_tests.cpp
   camera_tests.cpp
   pipeline_tests.cpp
@@ -10,6 +11,8 @@ set(TEST_SOURCES
   config_tests.cpp
   ai_detector_tests.cpp
   metadata_tests.cpp
+  hand_analyzer_tests.cpp
+  hand_detector_tests.cpp
 )
 
 # Reuse the SIM backend sources from the app (deterministic, headless).
@@ -21,10 +24,15 @@ set(APP_SIM_SOURCES
   ${PROJECT_SOURCE_DIR}/src/pipeline/video_pipeline_sim.cpp
   ${PROJECT_SOURCE_DIR}/src/rtsp/rtsp_publisher_sim.cpp
   # AI branch: stream_controller owns an AIPipeline, so it must link too.
-  # Tests build without ONNX Runtime -> the null detector is used.
+  # Tests build without ONNX Runtime -> the null detector is used. The hand
+  # branch is analyzer/decode only in that configuration, which is exactly the
+  # part that has no model dependency.
   ${PROJECT_SOURCE_DIR}/src/ai/ai_pipeline.cpp
   ${PROJECT_SOURCE_DIR}/src/ai/byte_tracker.cpp
   ${PROJECT_SOURCE_DIR}/src/ai/yolo_detector.cpp
+  ${PROJECT_SOURCE_DIR}/src/ai/hand_decode.cpp
+  ${PROJECT_SOURCE_DIR}/src/ai/hand_detector.cpp
+  ${PROJECT_SOURCE_DIR}/src/ai/hand_analyzer.cpp
   # Metadata branch: stream_controller owns a MetadataManager, so it must link.
   ${PROJECT_SOURCE_DIR}/src/metadata/metadata_encoder.cpp
   ${PROJECT_SOURCE_DIR}/src/metadata/metadata_manager.cpp

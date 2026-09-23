@@ -31,7 +31,8 @@
 #include <thread>
 #include <vector>
 
-#define STB_IMAGE_IMPLEMENTATION
+// Declaration only: stb_image_impl.cpp owns the single implementation, so this
+// file (and every other test file) can decode fixtures without ODR clashes.
 #include "stb_image.h"
 
 namespace {

@@ -8,6 +8,12 @@ set(SOURCES
   ai/ai_pipeline.cpp
   ai/byte_tracker.cpp
   ai/yolo_detector.cpp
+  # Hand branch (Phase 1): MediaPipe palm -> landmark cascade + the temporal
+  # analyzer. Both compile without ORT (the detector falls back to a null
+  # implementation) so the pipeline, mode switching and analyser still build.
+  ai/hand_decode.cpp
+  ai/hand_detector.cpp
+  ai/hand_analyzer.cpp
   # Metadata branch (Phase 2): encode -> bounded queue -> async sender thread.
   metadata/metadata_encoder.cpp
   metadata/metadata_manager.cpp

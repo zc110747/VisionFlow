@@ -8,3 +8,4 @@ auto.key
 
 build-msvc
 build-msvc-gst
+build-msvc-debug
