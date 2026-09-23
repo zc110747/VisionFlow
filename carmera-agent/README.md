@@ -71,7 +71,7 @@ camera-agent/
 │   └── common/stream_controller.cpp  # 编排 + 自动重连
 ├── third_party/
 │   └── stb_image.h           # 单元测试用的单头 JPEG/PNG 解码（仅 tests 链接）
-├── tests/                    # 轻量测试框架 + 55 个用例（强制 SIM 后端，可无头运行）
+├── tests/                    # 轻量测试框架 + 56 个用例（强制 SIM 后端，可无头运行）
 │   ├── golden/               # 手部黄金夹具 + 全量 anchor 参考表 + 生成脚本（见 golden/README.md）
 │   └── finished/             # 运行/验证产物（日志、抓帧）落此处，已 gitignore
 └── scripts/
@@ -439,9 +439,11 @@ start.bat --ai-mode hand        # 联合运行（server + agent）直接以手�
 
 | 项 | 状态 |
 |---|---|
-| `kCurledRatio = 0.90`（握拳侧阈值） | **未实测**。黄金夹具里没有握拳样本；需真机补一张 fist 图后才能定。`kExtendedRatio` 有实测出处，这个没有 |
+| `kCurledRatio = 1.10`（握拳侧阈值） | **已实测**（2026-09-23，真机 LRCP USB2.0）。原先的 0.90 是未验证的占位值，实测发现它落在**真实握拳簇内部** —— 真握拳的 middle 指会冲到 0.983，导致四指里只有 2 指投 curled、拿不到 0.75 票，**14 帧真握拳里有 11 帧输出 `UNKNOWN`**。现取值 1.10：比握拳簇高 0.117、比开掌簇低 0.329，且仍在 `kExtendedRatio`(1.15) 之下。回归用例 `hand_gesture_real_capture_open_and_fist` 用本次实测的 landmark 逐位钉住 |
+| **index 指在握拳时从不投 curled** | **已知几何限制，非标定问题**。MCP5 是四指里离腕点最近的，故握拳时 index 比值仍在 1.2–1.4（> `kExtendedRatio`），反而投 extended。**FIST 实际只靠 middle/ring/pinky 三指，且恰好卡在 `kGestureVote=0.75` 的等号上** ⇒ 这三指若有一指被遮挡，手势就会丢失。根治需要按手指归一化（或用 PIP/DIP 关节），属分类器改动，Phase 1 不做 |
 | `depth_source` 的方向（哪个符号是"靠近"） | **待真机实验**（`--ai-hand-depth` 可切换两种来源对比） |
 | 真实 UVC 摄像头的 `invert_*` 取值 | **待真机实验**（`--ai-hand-invert-x/-y/-z`） |
+| 画面疑似整体旋转 90° | **待确认**（真机帧里天花板灯板出现在画面左侧、玻璃隔断在右侧）。这会影响 §17 logical 坐标系与 P3 前端 overlay 朝向 |
 
 模型溯源、I/O 实测形状与 SHA-256：`models/README.md`。
 黄金夹具、全量 anchor 参考表与生成脚本：`tests/golden/README.md`。
@@ -459,7 +461,7 @@ ctest --test-dir build-msvc --output-on-failure
 ctest --test-dir build --output-on-failure
 ```
 
-覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、**运行时 AI 模式切换（Detect↔Pose、Detect↔Hand 不重启）**、手部（anchor 全 2016 值核对、黄金图 21 点亚毫像素比对、坐标映射/EMA/reference/deadzone/手势去抖、hand 报文逐字节固定）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）。**55/55 通过**。
+覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、**运行时 AI 模式切换（Detect↔Pose、Detect↔Hand 不重启）**、手部（anchor 全 2016 值核对、黄金图 21 点亚毫像素比对、坐标映射/EMA/reference/deadzone/手势去抖、hand 报文逐字节固定）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）、**手势真机数据回归（实测开掌/握拳 landmark 逐位冻结，钉住 `kCurledRatio`）**。**56/56 通过**。
 
 ### 2. 端到端验收（`scripts/e2e-test.ps1`，真实 GStreamer 后端）
 
@@ -697,7 +699,7 @@ Camera (mfvideosrc 1280x720@30)
 
 ### 单元测试（无头端到端）
 
-`tests/ai_detector_tests.cpp` 三个用例（已合入 ctest，55/55 总通过）：
+`tests/ai_detector_tests.cpp` 三个用例（已合入 ctest，56/56 总通过）：
 
 - `ai_detector_bus_image`：在 Ultralytics 官方 `bus.jpg` 上跑真模型，断言 ≥1 个 person、bbox 全在 `[0,w]×[0,h]` 内。**实测 4 个 person**。
 - `ai_tracker_stable_ids`：3 帧直线漂移的合成检测 → 1 个稳定 track id。
@@ -894,7 +896,7 @@ std::unique_ptr<IMetadataTransport> create_metadata_transport(const MetadataConf
 | 5 | **AI 异常** | 模型路径故意填错 `models/does-not-exist.onnx` + `--ai --metadata`（`--source videotestsrc`） | 日志 `[AI] model file not found` → `[AI] model init failed (...), video stream continues without AI` → `[warning] [AI] not started; video stream is unaffected`；视频全程 `STREAMING`（frames=424 `dropped=0` bitrate≈4070kbps），AI 不产出结果 → metadata 只剩心跳（`sent=3`，无 `frame` 消息）；mock 收到 cam_t5 共 3 条；agent 正常退出（exit=0） |
 | 6 | **AI 关闭** | `--no-ai --metadata`（`--source videotestsrc`） | 视频正常 `STREAMING`（frames=426 `dropped=0` bitrate≈3897kbps）；管线不含 tee/aisplit（AI 分支完全不挂载）；metadata 仅发心跳（每 5s 一条，`sent=3`，mock 收到 cam_t6 共 3 条）；agent 正常退出（exit=0） |
 
-单元测试 **55/55 通过**；下表为 Metadata 分支直接相关的 9 个（手部用例见 `tests/hand_wiring_tests.cpp`）：
+单元测试 **56/56 通过**；下表为 Metadata 分支直接相关的 9 个（手部用例见 `tests/hand_wiring_tests.cpp`）：
 
 | 用例 | 断言要点 |
 |------|----------|

@@ -10,8 +10,14 @@
 MSVC_BASE="${MSVC_BASE:-D:/Software/vs/VC/Tools/MSVC}"
 KITS="${WIN_KITS:-C:/Program Files (x86)/Windows Kits/10}"
 
-VCVER="$(ls -1 "$MSVC_BASE" 2>/dev/null | sort -V | tail -1)"
-SDKVER="$(ls -1 "$KITS/Include" 2>/dev/null | sort -V | tail -1)"
+# `sort` is shadowed by C:\Windows\System32\sort.exe in this shell (Git Bash
+# exposes it as /tmp/system32/sort). That one has no -V, so the detection below
+# dies with "could not detect MSVC toolset or Windows SDK" even though both are
+# installed. Force the MSYS2 coreutils sort when it is present.
+SORT="$( [ -x /usr/bin/sort ] && echo /usr/bin/sort || echo sort )"
+
+VCVER="$(ls -1 "$MSVC_BASE" 2>/dev/null | "$SORT" -V | tail -1)"
+SDKVER="$(ls -1 "$KITS/Include" 2>/dev/null | "$SORT" -V | tail -1)"
 
 if [ -z "$VCVER" ] || [ -z "$SDKVER" ]; then
   echo "msvc-env: could not detect MSVC toolset or Windows SDK" >&2

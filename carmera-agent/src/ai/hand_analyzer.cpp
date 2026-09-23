@@ -24,11 +24,37 @@ namespace {
 // the four measured ratios are 1.5927 / 1.7069 / 1.6751 / 1.5901 for one hand
 // and 1.7354 / 1.8355 / 1.7877 / 1.6845 for the other - see
 // tests/golden/README.md. 1.15 therefore sits far below real open-hand data.
-// The CURLED side cannot be calibrated from these samples (neither hand is a
-// fist) and is deliberately placed below 1.0 with a margin band; it is the one
-// number in this file that still needs the live, spec 16 style experiment.
+//
+// The CURLED side is now measured too, on a live UVC camera (the spec-16 style
+// experiment this comment used to ask for). Two independent steady holds:
+//
+//   steady OPEN PALM, 55 frames / 10.8 s      steady FIST, 14 frames
+//     index  1.587 - 1.782                      index  1.222 - 1.398
+//     middle 1.621 - 1.875                      middle 0.850 - 0.983
+//     ring   1.516 - 1.734                      ring   0.731 - 0.871
+//     pinky  1.429 - 1.534                      pinky  0.722 - 0.963
+//
+// The two clusters are separated by the gap [0.983, 1.429] on the worst finger,
+// so any threshold inside that gap classifies both poses. 0.90 was NOT inside
+// it: a real fist pushes the MIDDLE finger as high as 0.983, which left the
+// fist with only two curled votes (the vote needs 0.75 = 3 of 4) and the
+// classifier answered UNKNOWN on 11 of 14 real fist frames. 1.10 fixes that
+// with 0.117 of margin above the fist cluster and 0.329 below the palm cluster.
+//
+// 1.10 is also as high as it may go: hand_classify_gesture() below is an
+// if/else-if, so the dead band IS [kCurledRatio, kExtendedRatio]. Letting the
+// two cross would silently void that band instead of failing loudly.
+//
+// KNOWN LIMITATION, geometry, not tuning: the INDEX finger never votes curled.
+// MCP 5 is the knuckle closest to the wrist, so even in a tight fist the index
+// ratio stays ~1.2-1.4 (above kExtendedRatio) and it votes EXTENDED instead.
+// FIST therefore rides on exactly three fingers (middle/ring/pinky) always
+// agreeing, i.e. on the 0.75 vote being met at equality. Occluding any one of
+// those three will lose the gesture. Fixing that needs a finger-specific
+// baseline (or the PIP/DIP joints), which is a classifier change, not a
+// threshold change - deliberately out of scope for Phase 1.
 constexpr float kExtendedRatio = 1.15f;
-constexpr float kCurledRatio   = 0.90f;
+constexpr float kCurledRatio   = 1.10f;
 
 // Share of the four fingers that must agree before a gesture is reported.
 // Below this the hand is between poses and the honest answer is UNKNOWN.

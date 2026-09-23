@@ -140,7 +140,21 @@ rather than calling the formula under test - regenerating it from
 `palm_build_anchors()` would make the test unable to detect a wrong formula.
 
 When adding a second fixture, prefer a case the current one does **not** cover -
-a **fist** (the curled threshold `kCurledRatio` is the one still-unvalidated
-number), a hand at a different distance, or a rotated hand. A fist fixture is the
-highest-value addition, because it is the only way to close the last
-unmeasured constant in the gesture classifier.
+a hand at a different distance, a rotated hand, or a second pose.
+
+**The fist case has since been closed, but not with an image fixture.** The
+curled threshold `kCurledRatio` used to be the one unmeasured constant here. It
+was calibrated on 2026-09-23 against a live UVC camera instead of a still,
+because a still fist would have had to be committed into the repo (and a webcam
+frame contains the operator's face and workplace). The evidence is therefore
+frozen as **landmark tables** rather than pixels:
+`tests/hand_analyzer_tests.cpp :: hand_gesture_real_capture_open_and_fist`
+holds the verbatim 21-point output of two steady holds (open palm, fist), and
+that test is what pins `kCurledRatio = 1.10`. Offline re-derivation recipe and
+the full distributions: `../../../docs/prompter/hand-3d-phase1-architecture.md`.
+
+A fist *image* would still add value - it is the only way to re-run the palm
+detector and landmark model on a curled hand and confirm they find it at all
+(the tables above only prove the classifier separates a fist that was found).
+If one is added, add the hand region only, and record its licence and
+provenance here like `woman_hands.png` below.

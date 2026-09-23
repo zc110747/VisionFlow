@@ -176,7 +176,7 @@ camera ──tee──┬──► video pipeline ──────────
 | **P1b** | `HandDetector`：palm → 旋转裁切 → landmark，含自实现重采样/仿射/解码 | 黄金比对 **dx 0.00034 px** | ✅ 完成并提交 |
 | **P1c** | `HandAnalyzer`：坐标映射 / EMA / reference / deadzone / motion / gesture 去抖 | 13 个无模型单测全绿 | ✅ 完成并提交 |
 | **P1d** | 接线：`AIMode::Hand` + `hand` metadata 编码 + config/CLI | 双构零警告 | ✅ 完成并提交 |
-| **P1e** | P1 验收：真机 720p@30 出 `ai-hand` 帧 + 补 fist 夹具定 `kCurledRatio` | 全链路真机跑通（需举手配合） | 待开始 |
+| **P1e** | P1 验收：真机 720p@30 出 `ai-hand` 帧 + 定 `kCurledRatio` | 全链路真机跑通（需举手配合） | ✅ 完成（见 §11） |
 | **P2** | server：schema 增量列 + `hand` 解码/校验 + append-only `ai_hand_log` 录制器 + `hand_session_*.json` 导出 + `ai-hand` 放行 | `go test ./...` 全绿 + 真机 metadata 落库 | 待开始 |
 | **P3** | 前端：21 点手部骨架 overlay + HUD + `HandPanel` 调试面板 + `ai-hand` 按钮（只消费 metadata） | 构建零错误 + 无头渲染断言 | 待开始 |
 | **P4** | 端到端：`verify_hand.py`（PASS/FAIL 计数）+ §16 坐标方向实验记录 + README | 全链路真机跑通 | 待开始 |
@@ -284,4 +284,92 @@ fist 图 —— 这是本阶段显式标注的未验证项，不是遗漏。
 CLI 与 YAML 的区别只在错误处理：CLI 打错是 `exit 2`（操作者刚敲的），YAML 打错是 WARN + 保持默认
 （配置文件里的一个手误不该让整次运行失败）。`depth_source` 同样按闭集校验，因为它一旦落到
 mapper 的默认分支，"方向实验"就会在操作者以为测了另一个轴的情况下给出结论。
+
+---
+
+## 11. P1e 实证记录：真机验收与 `kCurledRatio` 标定（2026-09-23）
+
+### 11.1 真机链路通过（P1e 第一半）
+
+`camera-agent --camera 0 --width 1280 --height 720 --fps 30 --ai --ai-mode hand`
+（真实 LRCP USB2.0，`nvh264enc` 硬编）：
+
+```
+[HAND] ready: palm=...2023feb.onnx (2016 anchors) landmark=...2023feb.onnx (21 keypoints)
+[AI]   ready: backend=onnxruntime(mediapipe-hand) mode=hand(21kpt)
+Negotiated capture format: 1280x720 @ 30fps
+[AI] mode=hand fps=5.0 infer=11.4~28.3ms     [METADATA] sent=72 failed=0 reconnect=0
+```
+
+⇒ 视频流与 metadata 双链路在真机上独立跑通，`ai_mode:"ai-hand"` 报文零失败送达。
+
+### 11.2 踩到的两个坑（**都不是代码问题**，但都伪装成代码问题）
+
+**① 摄像头枚举骗人。** `--list` 列出**两条** `LRCP USB2.0`，其实是**同一台物理设备被枚举两次**
+（DirectShow 只认到一个：`VID_0C45&PID_6366`）。`--camera 1` 起流即
+`gst_base_src_start / Failed to start` → `camera busy / unavailable?`。
+**本机只有 index 0 可用**，双摄并行这条路不通。判据：**`--list` 能列出 ≠ 能打开，必须实跑一次。**
+
+**② 镜头被遮挡，且症状是"又暗又糊"而不是"全黑"。** 遮挡期间连跑 5 分钟 **1498 帧、0 次检出**。
+我没有把它归因于"操作者没摆姿势"，而是去量化画面：
+
+| 指标 | 遮挡时 | 解除后对照（黄金夹具） | 比值 |
+|---|---|---|---|
+| 平均亮度 YAVG | 62.4 / 255 | 85.7 | 0.73× |
+| 边缘能量（`edgedetect` 后 YAVG） | **0.769** | 4.287 | **0.18×** |
+
+**取证手法（可复用）**：agent 推流时**直接从 RTSP 拉帧**
+（`ffmpeg -rtsp_transport tcp -i rtsp://127.0.0.1:8554/camera01 -frames:v 1 x.png`）。
+好处是①**零摄像头争用**（本机只有一个物理设备，另开一次采集会把 agent 顶掉）；
+②拿到的正是 tee 分支上游、**AI 分支同一路**的画面，验证力强于另开一次采集。
+`edgedetect` 的边缘能量比"暗不暗"可靠得多 —— 遮挡的真实症状是**没有锐利边缘**。
+
+### 11.3 `kCurledRatio`：0.90 → 1.10（**本轮唯一的行为改动**）
+
+**为什么旧值必错。** 0.90 是 P1c 时**没有握拳样本**情况下的占位值（代码注释当时就写明
+"still needs the live experiment"）。实测两段独立稳态：
+
+| 手指 | 稳态**开掌**（55 帧 / 10.8 s） | 稳态**握拳**（14 帧） |
+|---|---|---|
+| index | 1.587 – 1.782 | **1.222 – 1.398** |
+| middle | 1.621 – 1.875 | **0.850 – 0.983** ← 冲到 0.983 |
+| ring | 1.516 – 1.734 | 0.731 – 0.871 |
+| pinky | 1.429 – 1.534 | 0.722 – 0.963 |
+
+旧阈值下，真握拳的四指投票是 `extended=1 / curled≤2`，而 `kGestureVote=0.75` 需要 3 指 —— 
+**14 帧真握拳里 11 帧输出 `UNKNOWN`**（`gesture_candidate` 已经是 `FIST`，但票数不够）。
+
+**新值怎么定。** 最差手指上的簇间距是 **`[0.983, 1.429]`**，阈值落在其间即可分开两种姿势。
+1.10 比握拳簇高 **0.117**、比开掌簇低 **0.329**；且**必须**仍在 `kExtendedRatio = 1.15` 之下
+—— `hand_classify_gesture()` 是 `if / else if`，**死区就是 `[kCurledRatio, kExtendedRatio]`**，
+两者一旦交叉，死区会**静默失效**而不是报错。
+
+**几何限制（不是标定问题，Phase 1 不修）**：**index 指在握拳时永远不投 curled**。
+`MCP5` 是四指里离腕点最近的，所以即便紧握拳，index 比值仍在 1.2–1.4（> `kExtendedRatio`），
+反而投 extended。⇒ **FIST 实际只靠 middle/ring/pinky 三指，且恰好卡在 `kGestureVote=0.75` 的
+等号上**；这三指若有一指被遮挡，手势就会丢。根治要按手指归一化（或用 PIP/DIP 关节），
+属分类器改动，刻意留到后续阶段。
+
+### 11.4 为什么用 landmark 表而不是图片夹具
+
+真机帧里**有操作者的脸和办公环境**，把摄像头截图提交进仓库是隐私问题。而
+`hand.landmarks` 是**图像像素坐标、2 位小数**，精度远高于要标定的 ratio，
+**报文本身就够做标定**。所以证据以 landmark 表的形式冻结在
+`tests/hand_analyzer_tests.cpp :: hand_gesture_real_capture_open_and_fist`，
+逐位复现本轮实测输入。离线复算脚本：`carmera-agent/tests/finished/p1e-smoke/analyze_hand_log.py`
+（按 `kTips={8,12,16,20}` / `kMcps={5,9,13,17}` 逐字复刻 C++ 公式，输出四指分位分布 +
+直方图 + Otsu 阈值建议）。
+
+**⚠️ 脚本自身的坑（已修）**：Otsu 拿"每帧四指中位数"做二分类时，**过渡帧**（手出入画、
+运动模糊）在构造上就落在谷底且数量占优，会把阈值**往上拉**——第一版因此给出 1.3546，
+甚至**越过了 `kExtendedRatio`**。现在脚本会把它当上界并强制钳到 `kExtendedRatio - 0.05`。
+标定姿势必须**保持不动**，否则测的是过渡而不是姿势。
+
+### 11.5 仍未验证
+
+- `depth_source` 的方向（哪个符号是"靠近"）与真实 UVC 的 `invert_*` 取值。
+- **画面疑似整体旋转 90°**：真机帧里天花板灯板出现在**画面左侧**、玻璃隔断在右侧，
+  即场景的"上"沿画面水平轴。这直接关系到 §17 的 logical 坐标系
+  （X+ 右 / Y+ 前 / Z+ 上）能否成立，也决定 P3 前端 overlay 的朝向 —— 需确认是物理安装
+  还是画面本身如此，**在 P3 动工前必须解决**。
 

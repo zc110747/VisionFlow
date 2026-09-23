@@ -147,9 +147,17 @@ TEST(hand_motion_deadzone) {
 // ---------------------------------------------------------------------------
 TEST(hand_gesture_open_fist_ambiguous) {
     ASSERT_EQ(ca::hand_classify_gesture(make_hand(1.70f)).g, ca::Gesture::OpenPalm);
-    ASSERT_EQ(ca::hand_classify_gesture(make_hand(1.00f)).g, ca::Gesture::Unknown);
+    // The dead band is [kCurledRatio, kExtendedRatio] = [1.10, 1.15]. It used to
+    // be [0.90, 1.15]; 0.90 turned out to be inside the real fist cluster, so the
+    // band narrowed. 1.12 is inside the band now.
+    ASSERT_EQ(ca::hand_classify_gesture(make_hand(1.12f)).g, ca::Gesture::Unknown);
     ASSERT_EQ(ca::hand_classify_gesture(make_hand(0.80f)).g, ca::Gesture::Fist);
     ASSERT_EQ(ca::hand_classify_gesture(make_hand(0.10f)).g, ca::Gesture::Fist);
+
+    // Both edges, so a future edit that crosses the two constants (which would
+    // silently void the dead band rather than fail loudly) is caught here.
+    ASSERT_EQ(ca::hand_classify_gesture(make_hand(1.09f)).g, ca::Gesture::Fist);
+    ASSERT_EQ(ca::hand_classify_gesture(make_hand(1.16f)).g, ca::Gesture::OpenPalm);
 
     // Confidence is the share of the four fingers that voted.
     ASSERT(std::fabs(ca::hand_classify_gesture(make_hand(1.70f)).confidence - 1.0f) < 1e-6f);
@@ -158,6 +166,74 @@ TEST(hand_gesture_open_fist_ambiguous) {
     std::vector<ca::Keypoint> few(5);
     ASSERT_EQ(ca::hand_classify_gesture(few).g, ca::Gesture::Unknown);
     ASSERT_EQ(ca::hand_classify_gesture(std::vector<ca::Keypoint>{}).g, ca::Gesture::Unknown);
+    return true;
+}
+
+// Build a detection from a flat landmark table.  Unlike make_hand() these are
+// REAL coordinates, so the four ratios differ per finger - which is the whole
+// point: the failure that set kCurledRatio was the index finger behaving
+// differently from the other three.
+ca::HandDetection hand_from_table(const float lm[21][3]) {
+    ca::HandDetection d;
+    d.detected   = true;
+    d.confidence = 0.9f;
+    d.handedness = ca::Handedness::Right;
+    d.landmarks.resize(21);
+    for (int i = 0; i < 21; ++i) {
+        auto& k = d.landmarks[static_cast<size_t>(i)];
+        k.x = lm[i][0];
+        k.y = lm[i][1];
+        k.z = lm[i][2];
+        k.conf = 0.9f;
+    }
+    return d;
+}
+
+// ---------------------------------------------------------------------------
+// spec 16 / P1e - the numbers that kCurledRatio is calibrated against.
+//
+// Provenance: live LRCP USB2.0 camera, 1280x720@30, --ai-mode hand; the tables
+// below are the landmarks verbatim from the metadata payload of the named
+// frame, so this test reproduces the exact input that the live experiment saw.
+// Offline re-derivation (four ratios, histogram, Otsu): P1e notes in
+// docs/prompter/hand-3d-phase1-architecture.md.
+//
+// These two vectors are the reason kCurledRatio moved 0.90 -> 1.10: with the
+// old value the fist frame below emitted UNKNOWN on 11 of 14 live fist frames.
+// ---------------------------------------------------------------------------
+TEST(hand_gesture_real_capture_open_and_fist) {
+    // steady OPEN PALM - ratios 1.6878 / 1.7655 / 1.6755 / 1.4838
+    static const float kOpenPalm[21][3] = {
+        {943.76f, 321.79f,   0.00f}, {906.34f, 385.56f,  -2.02f}, {849.37f, 415.43f,  -1.89f},
+        {797.59f, 419.57f,  -4.47f}, {760.41f, 409.33f,  -7.56f}, {776.06f, 368.63f,  17.71f},
+        {722.93f, 386.17f,  15.90f}, {690.79f, 402.07f,  10.51f}, {664.21f, 417.06f,   5.96f},
+        {768.49f, 337.72f,  12.55f}, {704.55f, 349.99f,  10.66f}, {665.55f, 366.09f,   0.61f},
+        {638.90f, 385.35f,  -7.28f}, {772.23f, 306.91f,   5.16f}, {709.82f, 311.94f,  -0.09f},
+        {676.57f, 330.37f, -11.17f}, {657.32f, 351.73f, -18.79f}, {786.79f, 273.95f,  -3.14f},
+        {738.23f, 267.28f,  -9.32f}, {715.12f, 278.17f, -15.84f}, {702.56f, 295.24f, -20.69f},
+    };
+    const ca::GestureResult o =
+        ca::hand_classify_gesture(hand_from_table(kOpenPalm).landmarks);
+    ASSERT_EQ(o.g, ca::Gesture::OpenPalm);
+    ASSERT(std::fabs(o.confidence - 1.0f) < 1e-6f);   // all four fingers agree
+
+    // steady FIST - ratios 1.3171 / 0.9154 / 0.8268 / 0.9026
+    // The index stays EXTENDED (see the KNOWN LIMITATION note in
+    // hand_analyzer.cpp: MCP 5 is the knuckle nearest the wrist).  The gesture
+    // therefore rides on the other three and lands exactly on kGestureVote.
+    static const float kFist[21][3] = {
+        {1037.29f, 624.99f,   0.00f}, {1023.49f, 535.79f,   0.99f}, {992.62f, 465.95f,  -6.14f},
+        { 962.16f, 428.01f, -17.80f}, { 931.99f, 425.56f, -29.40f}, {896.69f, 485.57f,   0.43f},
+        { 856.25f, 442.71f, -11.17f}, { 882.76f, 413.06f, -18.76f}, {918.25f, 394.19f, -23.95f},
+        { 883.49f, 522.70f, -11.59f}, { 864.47f, 471.04f, -27.36f}, {925.40f, 463.08f, -35.80f},
+        { 977.53f, 471.54f, -39.77f}, { 881.52f, 564.65f, -24.75f}, {868.17f, 508.72f, -38.13f},
+        { 929.63f, 498.59f, -41.96f}, { 981.55f, 504.62f, -43.57f}, {891.76f, 609.09f, -38.94f},
+        { 883.12f, 559.80f, -47.25f}, { 924.71f, 531.29f, -48.39f}, {964.51f, 520.14f, -49.04f},
+    };
+    const ca::GestureResult f =
+        ca::hand_classify_gesture(hand_from_table(kFist).landmarks);
+    ASSERT_EQ(f.g, ca::Gesture::Fist);
+    ASSERT(std::fabs(f.confidence - 0.75f) < 1e-6f);   // 3 of 4 - exactly the gate
     return true;
 }
 
