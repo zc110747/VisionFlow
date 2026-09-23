@@ -2,11 +2,15 @@
   <div class="player-wrap">
     <video ref="videoEl" autoplay playsinline muted></video>
 
-    <!-- AI tracking-box overlay. Pointer-events disabled so the WebRTC /
-         fullscreen controls above stay clickable. The canvas is drawn from the
-         latest GET /api/cameras/{id}/metadata frame, scaled to the displayed
-         video size. -->
+    <!-- AI overlay. Pointer-events disabled so the WebRTC / fullscreen controls
+         above stay clickable. The canvas is drawn from the latest
+         GET /api/cameras/{id}/metadata frame, scaled to the displayed video
+         size. -->
     <canvas ref="canvasEl" class="box-overlay"></canvas>
+
+    <!-- Hand HUD. Shown only in hand mode: in any other mode there is no hand
+         block, so it would be a permanent "NO DATA" box. -->
+    <HandHud v-if="aiMode === 'ai-hand'" :hand="handState" />
 
     <!-- Autoplay can be refused on phones (low power / data saver). Without a
          visible affordance the symptom is just "a black rectangle". -->
@@ -21,12 +25,18 @@
     </div>
 
     <!-- AI mode selector. ai-off only hides the overlay (the agent keeps its
-         model); ai-y / ai-y-pose POST to the server so the agent polls and
-         swaps its detector. The UI flips immediately on click - we do NOT wait
-         for the server round-trip. On switch we clear the overlay at once and
-         only resume drawing once an incoming frame matches the new mode; any
-         intermediate frame from the still-swapping model (stamped with the OLD
-         mode) is dropped by pollMetadata() - never composited as a stale box. -->
+         model); ai-y / ai-y-pose / ai-hand POST to the server so the agent
+         polls and swaps its detector. The UI flips immediately on click - we
+         do NOT wait for the server round-trip. On switch we clear the overlay
+         at once and only resume drawing once an incoming frame matches the new
+         mode; any intermediate frame from the still-swapping model (stamped
+         with the OLD mode) is dropped by pollMetadata() - never composited as
+         a stale box.
+
+         NOTE: ai-hand is a hard server-side prerequisite. The agent polls the
+         selected mode and reverts to detect within ~1s unless the server
+         accepts "ai-hand" (see ValidAIMode in internal/metadata/model.go). A
+         UI button alone does not enable it. -->
     <div class="ai-mode-bar">
       <button
         v-for="m in aiModeOptions"
@@ -56,20 +66,35 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { FullScreen } from '@element-plus/icons-vue'
 import { StreamPlayer, type PlayerStatus } from '@/webrtc/player'
-import { api, AI_MODES, DEFAULT_AI_MODE, type AIMode, type MetadataSnapshot } from '@/api/client'
+import {
+  api,
+  AI_MODES,
+  DEFAULT_AI_MODE,
+  type AIMode,
+  type HandState,
+  type MetadataSnapshot
+} from '@/api/client'
+import { drawSkeleton, drawHandLandmarks } from '@/ai/draw'
+import HandHud from '@/components/HandHud.vue'
 
 const props = defineProps<{ cameraId: string }>()
+// The parent (CameraView) owns the side panel, so the hand block is pushed up
+// instead of being polled twice - two pollers would show two slightly
+// different frames and any disagreement would look like a rendering bug.
+const emit = defineEmits<{ (e: 'hand-update', hand: HandState | null): void }>()
 
 // ---- AI mode (web-driven model selection) -----------------------------------
 //
 // ai-off      -> hide the overlay only; the agent keeps its loaded model.
 // ai-y        -> person detection (yolo11n).
 // ai-y-pose   -> person detection + 17 COCO keypoints (yolo11n-pose).
+// ai-hand     -> single hand: 21 landmarks + 3D motion + gesture.
 const aiMode = ref<AIMode>(DEFAULT_AI_MODE)
 const aiModeOptions = [
   { value: 'ai-off' as AIMode, label: 'AI 关' },
   { value: 'ai-y' as AIMode, label: '人检测' },
-  { value: 'ai-y-pose' as AIMode, label: '姿态' }
+  { value: 'ai-y-pose' as AIMode, label: '姿态' },
+  { value: 'ai-hand' as AIMode, label: '手势' }
 ]
 
 // Flip the UI selection immediately - the overlay switches at once and any
@@ -81,28 +106,19 @@ const aiModeOptions = [
 // transient network blip never blocks the UI or the running video stream.
 function selectAIMode(m: AIMode) {
   if (m === aiMode.value) return
-  closeOverlayNow()
+  resetOverlay()
   aiMode.value = m
   api
     .setAIMode(props.cameraId, m)
     .catch((e) => console.error('setAIMode failed', e))
 }
 
-// Clear the overlay canvas right now (called the moment a mode switch starts so
-// stale boxes disappear before the agent has finished swapping its model).
-function closeOverlayNow() {
-  const canvas = canvasEl.value
-  if (!canvas) return
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return
-  clearOverlay(canvas, ctx)
-  aiOn.value = false
-  objectCount.value = 0
-}
-
 async function loadAIMode() {
   try {
     const r = await api.getAIMode(props.cameraId)
+    // AI_MODES is the whitelist: a mode this build does not know is ignored
+    // (default stays). That is intentional - an unknown mode string would
+    // otherwise leave no button highlighted and no frame ever matching.
     if (AI_MODES.includes(r.mode)) aiMode.value = r.mode
   } catch {
     // Metadata disabled / not ready - fall back to the default (ai-y).
@@ -122,6 +138,11 @@ const status = reactive<PlayerStatus>({
 
 const aiOn = ref(false)
 const objectCount = ref(0)
+
+// Latest hand block, or null outside ai-hand mode / when no frame matched yet.
+// Held as state because the HUD is a Vue-rendered layer (HandHud.vue); the
+// display strings are derived inside that component, not here.
+const handState = ref<HandState | null>(null)
 
 const stateText = computed(() => {
   switch (status.state) {
@@ -152,20 +173,7 @@ function fullscreen() {
 
 // ---- AI metadata overlay ------------------------------------------------
 
-// COCO 17-joint skeleton (0-based indices), used to connect pose keypoints.
-// Order matches YOLO11n-pose output:
-// 0 nose, 1 leye, 2 reye, 3 lear, 4 rear, 5 lshoulder, 6 rshoulder, 7 lelbow,
-// 8 relbow, 9 lwrist, 10 rwrist, 11 lhip, 12 rhip, 13 lknee, 14 rknee,
-// 15 lankle, 16 rankle.
-const COCO_SKELETON: [number, number][] = [
-  [15, 13], [13, 11], [16, 14], [14, 12], [11, 12], [5, 11], [6, 12], [5, 6],
-  [5, 7], [6, 8], [7, 9], [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4]
-]
-// Keypoints below this confidence are drawn faintly / skipped for connections
-// so a spurious joint does not draw a stray line across the frame.
-const KP_MIN_CONF = 0.2
-
-// Poll the metadata endpoint and repaint the box overlay. The metadata frame
+// Poll the metadata endpoint and repaint the overlay. The metadata frame
 // carries bbox in ORIGINAL video pixels; we scale by the video element's
 // actual rendered size so the boxes track the displayed stream regardless of
 // layout. Missing frame / 0 detected objects simply clears the canvas.
@@ -183,9 +191,7 @@ async function pollMetadata() {
     snap = await api.cameraMetadata(props.cameraId)
   } catch {
     // Metadata disabled / not ready yet - keep the overlay empty.
-    clearOverlay(canvas, ctx)
-    aiOn.value = false
-    objectCount.value = 0
+    resetOverlay()
     return
   }
 
@@ -198,22 +204,26 @@ async function pollMetadata() {
   // every frame mismatches and is discarded. This only touches the overlay
   // <canvas>; the WebRTC <video> keeps playing, so the video stream never
   // stutters or drops frames.
-  const frameMode = snap.frame?.ai_mode
-  if (!frameMode || frameMode !== aiMode.value) {
-    clearOverlay(canvas, ctx)
-    aiOn.value = false
-    objectCount.value = 0
+  const frame = snap.frame
+  const frameMode = frame?.ai_mode
+  if (!frame || !frameMode || frameMode !== aiMode.value) {
+    resetOverlay()
     return
   }
 
   const vw = video.videoWidth
   const vh = video.videoHeight
-  if (!snap.frame || vw === 0 || vh === 0 || snap.frame.objects.length === 0) {
-    clearOverlay(canvas, ctx)
-    aiOn.value = !!snap.status?.running
-    objectCount.value = snap.frame?.object_count ?? 0
+  if (vw === 0 || vh === 0) {
+    resetOverlay()
     return
   }
+
+  // A hand block only ever rides an ai-hand frame, and the gate above already
+  // proved this IS one - so the presence of the block, not the mode string, is
+  // what decides whether the hand path runs.
+  const hand = frame.hand ?? null
+  handState.value = hand
+  emit('hand-update', hand)
 
   const cw = video.clientWidth
   const ch = video.clientHeight
@@ -233,7 +243,14 @@ async function pollMetadata() {
   ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
   ctx.textBaseline = 'alphabetic'
 
-  for (const o of snap.frame.objects) {
+  // On a hand frame the objects[] entry ("hand", 21 keypoints) and the hand
+  // block carry the SAME landmarks, so the skeleton is drawn once, from the
+  // hand block, and the object loop skips it. Drawing both would stack two
+  // identical skeletons - invisible until the two ever disagree, at which
+  // point it would look like a double-detection.
+  const handFrame = hand !== null
+
+  for (const o of frame.objects) {
     const [x1, y1, x2, y2] = o.bbox
     const rx = x1 * sx
     const ry = y1 * sy
@@ -260,50 +277,39 @@ async function pollMetadata() {
       ctx.fillText(tid, rx + rw - ctx.measureText(tid).width - padX, ly + lh - 4)
     }
 
-    // Pose model: draw the 17-joint skeleton on top of the box.
-    if (o.keypoints && o.keypoints.length === 17) {
+    // Skeleton, when the model produced one this build has a topology for.
+    if (!handFrame && o.keypoints) {
       drawSkeleton(ctx, o.keypoints, sx, sy)
     }
   }
 
-  aiOn.value = !!snap.status?.running
-  objectCount.value = snap.frame.objects.length
-}
+  if (hand) drawHandLandmarks(ctx, hand.landmarks, sx, sy)
 
-// Draw COCO keypoint dots + skeleton connections for one object. kps are
-// [x, y, conf] in ORIGINAL video pixels; sx/sy scale them to the canvas.
-function drawSkeleton(
-  ctx: CanvasRenderingContext2D,
-  kps: [number, number, number][],
-  sx: number,
-  sy: number
-) {
-  // Connections first (under the dots).
-  ctx.strokeStyle = 'rgba(255, 196, 0, 0.9)'
-  ctx.lineWidth = 2
-  for (const [a, b] of COCO_SKELETON) {
-    const ka = kps[a]
-    const kb = kps[b]
-    if (!ka || !kb) continue
-    if (ka[2] < KP_MIN_CONF || kb[2] < KP_MIN_CONF) continue
-    ctx.beginPath()
-    ctx.moveTo(ka[0] * sx, ka[1] * sy)
-    ctx.lineTo(kb[0] * sx, kb[1] * sy)
-    ctx.stroke()
-  }
-  // Dots on top.
-  ctx.fillStyle = 'rgba(255, 240, 170, 0.95)'
-  for (const k of kps) {
-    if (k[2] < KP_MIN_CONF) continue
-    ctx.beginPath()
-    ctx.arc(k[0] * sx, k[1] * sy, 2.5, 0, Math.PI * 2)
-    ctx.fill()
-  }
+  aiOn.value = !!snap.status?.running
+  objectCount.value = frame.objects.length
 }
 
 function clearOverlay(canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) {
   if (canvas.width === 0 || canvas.height === 0) return
   ctx.clearRect(0, 0, canvas.width, canvas.height)
+}
+
+// Blank the overlay and drop every piece of derived state. Called on any path
+// where the selected mode and the incoming frame disagree - including the mode
+// switch itself, so stale boxes AND a stale hand block disappear together
+// before the agent has finished swapping models.
+function resetOverlay() {
+  const canvas = canvasEl.value
+  if (canvas) {
+    const ctx = canvas.getContext('2d')
+    if (ctx) clearOverlay(canvas, ctx)
+  }
+  aiOn.value = false
+  objectCount.value = 0
+  if (handState.value !== null) {
+    handState.value = null
+    emit('hand-update', null)
+  }
 }
 
 onMounted(() => {
