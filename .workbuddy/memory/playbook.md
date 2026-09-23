@@ -220,9 +220,11 @@ middle/ring/pinky 三指，**恰好卡在 `kGestureVote=0.75` 的等号上**，�
 
 **标定方法（可复用）**：`hand.landmarks` 是**像素坐标 2 位小数**，精度远高于要标定的
 ratio ⇒ **报文本身就够标定，不用改代码不用重编**。脚本
-`tests/finished/p1e-smoke/analyze_hand_log.py`（`--tail` / `--gesture` / `--msg-from/-to`
-/ `--timeline` / `--hist`，含 Otsu）。⚠️ **Otsu 会被过渡帧拉偏**（过渡帧在构造上落在谷底
-且数量占优）⇒ 脚本已强制钳到 `kExtendedRatio - 0.05`；**标定姿势必须保持不动**。
+`carmera-agent/scripts/analyze_hand_landmarks.py`（`--tail` / `--gesture` / `--msg-from/-to`
+/ `--timeline` / `--hist`，含 Otsu；**已从 scratch 提升为仓库内正式工具**，因为它逐字复刻了
+`hand_classify_gesture()` 的公式，是复核阈值的唯一入口）。⚠️ **Otsu 会被过渡帧拉偏**
+（过渡帧在构造上落在谷底且数量占优，实测因此给出 1.3546 —— 越过了 `kExtendedRatio`）
+⇒ 脚本已强制钳到 `kExtendedRatio - 0.05`；**标定姿势必须保持不动**。
 
 ### 7.4 坑（本项目专属，方法论已升级到全局 playbook §11）
 

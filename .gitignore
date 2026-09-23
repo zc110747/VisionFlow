@@ -68,3 +68,5 @@ vcpkg_installed/
 Testing/
 .cache/
 finished
+__pycache__/
+*.pyc

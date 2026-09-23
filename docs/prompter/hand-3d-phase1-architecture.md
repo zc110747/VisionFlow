@@ -379,7 +379,8 @@ gesture_candidate: FIST 23 / OPEN_PALM 8
 `hand.landmarks` 是**图像像素坐标、2 位小数**，精度远高于要标定的 ratio，
 **报文本身就够做标定**。所以证据以 landmark 表的形式冻结在
 `tests/hand_analyzer_tests.cpp :: hand_gesture_real_capture_open_and_fist`，
-逐位复现本轮实测输入。离线复算脚本：`carmera-agent/tests/finished/p1e-smoke/analyze_hand_log.py`
+逐位复现本轮实测输入。离线复算脚本（**已提升为仓库内工具**）：
+`carmera-agent/scripts/analyze_hand_landmarks.py`
 （按 `kTips={8,12,16,20}` / `kMcps={5,9,13,17}` 逐字复刻 C++ 公式，输出四指分位分布 +
 直方图 + Otsu 阈值建议）。
 

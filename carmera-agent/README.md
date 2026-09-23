@@ -79,6 +79,7 @@ camera-agent/
     ├── build.ps1             # MSVC (Visual Studio 生成器，本机不可用，见下)
     ├── e2e-test.ps1          # 端到端验收（MediaMTX + 拉帧 + 断服重连 + auto-resume）
     ├── metadata-mock-server.py  # Metadata 验收用假服务端（仅标准库，可随时 kill 测重连）
+    ├── analyze_hand_landmarks.py  # 手部阈值离线标定（复刻 hand_classify_gesture 公式）
     └── probe-*.ps1           # 历史调试探针脚本（排查延迟/链路各段，见调试章节）
 ```
 
@@ -434,6 +435,28 @@ HandDetection ─► 坐标映射(spec 17) ─► EMA 滤波 ─► 参考点状
 camera-agent --ai --metadata --metadata-url http://127.0.0.1:8081/api/metadata --ai-mode hand
 start.bat --ai-mode hand        # 联合运行（server + agent）直接以手部模式起
 ```
+
+### 阈值怎么重新标定
+
+`hand.landmarks` 上报的是**图像像素坐标（2 位小数）**，精度远高于要标定的 ratio
+⇒ **报文本身就够标定，不用改代码、不用重编**。
+
+```bash
+# 1. 落全量报文（-u 关缓冲，否则重定向到文件看不到实时内容）
+python scripts/metadata-mock-server.py --port 8099 --dump > mock.jsonl &
+camera-agent --camera 0 --width 1280 --height 720 --fps 30 --ai --ai-mode hand \
+             --no-ai-aimode --metadata \
+             --metadata-url http://127.0.0.1:8099/api/metadata --duration 120
+
+# 2. 离线复算（脚本逐字复刻 hand_classify_gesture 的公式）
+python scripts/analyze_hand_landmarks.py mock.jsonl --timeline 60   # 先看时间线切段
+python scripts/analyze_hand_landmarks.py mock.jsonl --tail 30       # 只看最新一段
+python scripts/analyze_hand_landmarks.py mock.jsonl --hist          # 看双峰与谷底
+```
+
+⚠️ **标定时被标对象必须保持不动**：过渡帧（出入画、运动模糊）在分布上天然落在两簇之间的
+谷底且数量占优，会把阈值往上拉 —— 实测对"每帧四指中位数"跑 Otsu 得到 **1.3546**，
+甚至越过了 `kExtendedRatio`。脚本已把建议值钳到 `kExtendedRatio - 0.05`。
 
 ### 已知未验证项（显式标注，不含糊）
 
