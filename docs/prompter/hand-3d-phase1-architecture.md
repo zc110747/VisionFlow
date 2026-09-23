@@ -509,8 +509,11 @@ mfvideosrc device-index=0 ! queue ! videoconvert
 ```
 gofmt -l internal/ cmd/      → 无输出（干净）
 go vet ./...                 → 无输出（干净）
-go test ./...                → 61 PASS / 0 FAIL   （P2 新增 19 个用例）
+go test ./...                → 62 PASS / 0 FAIL   （P2 新增 20 个用例）
 ```
+
+> 首次 P2 落地时是 **61 PASS**；§13.10 补 `id` 字段后又加了
+> `TestHandLogRowIDSurvivesAnAgentRestart`，故为 62。
 
 真机（`start.bat --ai --ai-mode hand`，重编后 `video-server.exe` 13:18:22）：
 
@@ -521,6 +524,9 @@ go test ./...                → 61 PASS / 0 FAIL   （P2 新增 19 个用例）
 | `ai_hand_log` | **387 行**（快照），`frame_id` 4922..6369，`detected=0` ×387（镜头前当时无人举手） |
 | `ai_frame.hand` | `ai_mode='ai-hand'`，hand 块 327 B |
 | `GET /hand/sessions` | `total_rows` 与行数一致、`gap_ms=1000`、**0 会话** —— 与"全部 detected=false"自洽 |
+
+> 上表是**首次**跑通的记录（当时镜头前无人举手）。举手后的完整真机验收在 **§13.9**，
+> 那一轮才真正连上 agent 产出的 21 点数组。
 
 schema（在老库上确认，`addColumnIfMissing` 生效）：
 
@@ -615,13 +621,84 @@ ai_hand_log  id, camera_id, frame_id, timestamp,
 但不设防的验证脚本会因此得出**错误结论**并去改没坏的东西。
 P4 的 `verify_hand.py` 必须注意：要么先关 agent，要么用独立的 camera_id。
 
-### 13.9 仍未验证 / 待补
+### 13.9 真机验收（本轮完成）
 
-- **真机 `detected=true` 帧的会话与导出实证**（需举手配合）：要验的是 **agent 真实产出**的
-  21 点 `landmarks`（含 C++ 的定点格式）过库返回来还是不是原样。
-  §13.7 已用合成帧验过服务端这一侧，单测也覆盖，但**真机那一环还没连上**。
+栈自跑 `ai-hand`，人对着镜头举手（握拳 / 开掌），服务端全程录制。全部数字来自
+真机 DB 与对 `:8081` 的真实 HTTP，**不是合成帧**：
+
+| 项 | 实测 |
+|---|---|
+| `ai_hand_log` | 16460 行，其中 `detected=1` **2125 行**（`OPEN_PALM` 808 / `FIST` 683 / `UNKNOWN` 634） |
+| `detected=1` 区间 | `frame_id` 16458..76769、`timestamp` 549961..2560218 |
+| 每行 `landmarks` 点数 | 2125 行**全部 = 21**，异常 0 |
+| `GET /hand/sessions` | **194 个会话**（`gap_ms=1000`），最大会话 **559 帧** |
+| 导出 `#168` | 559 帧全部 `detected`，`OPEN_PALM`×132 / `UNKNOWN`×427 |
+| **逐字节保真** | 库里 559 条 payload 原文**全部**在导出响应中原样出现 = **559 / 559** |
+| 数值保真 | 559 帧 × 21 点 × 3 轴 = **35217 个坐标，不一致 = 0** |
+| 保真的可辨识证据 | 库里是 `"gesture_confidence":0.00`（Go 重编码会写 `0`）⇒ **原字节直存** |
+| `Content-Disposition` | `attachment; filename="hand_session_camera01_168.json"` |
+| 错误分支 9 项 | **9 OK / 0 MISMATCH**（400/404 分界与 §13.1 单测一致） |
+| `DELETE /hand/log` | `200 {"cleared":0}` —— 在**无 hand 行的历史诊断相机**上验，没动相机 01 的真实数据 |
+
+**零回归（真机 DB 直读）**：`ai_frame` 里 `camera01` 是 `ai_mode=ai-hand`、`hand` 非空
+（327 B）；历史相机 `testcam` 的 `ai_mode` 为 NULL、`hand` 列 **IS NULL**
+⇒ detect / pose 帧**从不写该列**，与单测 `TestFrameWithoutHandKeepsHandNull` 互证。
+
+#### 13.9.1 Landmark 坐标可以落在画面外 —— 这是设计，不是缺陷
+
+x ∈ [128.27, 1083.79] 全部落在 `[0,1280]` 内，但 **y 有 1070 个点 > 720（涉及 814 行）**。
+查实是两个事实叠加，**不是映射算错**：
+
+1. `hand_detector.cpp:782-783` 的 landmark 映射**刻意不 clamp**（忠实于参考实现），
+   而**同一个函数**里 bbox 是 clamp 的（`:810-813`）；
+2. 这一轮手**贴着画面底边举**：手腕 `y = 742~756`，本来就在 720 之外。
+   第二级裁切方块伸出画面下边界 ⇒ 边界外的手腕被算到画面外。
+
+**判据不需要看画面**：把腕点 y 与 `video_height` 比一下就能分辨
+"映射错了"（x 和 y 会一起越界）与"手本来就出框了"（只有 y 越界，且贴着某一条边）。
+**P3 影响**：canvas overlay **不能假设 landmark ∈ `[0,w]×[0,h]`**。canvas 自身会裁剪，
+所以画面不会画错；但任何"求均值 / 求包围盒 / 判断是否在画面内"的 HUD 逻辑必须显式处理。
+
+#### 13.9.2 `gap_ms` 只在**往小调**时生效（我第一轮测错了方向）
+
+真机相邻 hand 行的 `timestamp` 间隔 **p50 = 128ms**（≈ 8 fps）。所以任何
+`gap_ms >= 200` 都会把一整段 hold 桥接起来：
+
+| `gap_ms` | 30 | 60 | 100 | 128 | 200 | 500 | 1000 |
+|---|---|---|---|---|---|---|---|
+| 会话数 | 2193 | 2192 | 1955 | 697 | 195 | 195 | 194 |
+| 最大会话帧数 | 1 | 2 | 2 | 13 | 559 | 559 | 559 |
+
+我先把 `gap_ms` 往 **600000** 试，看到"完全不起作用"，一度以为参数失效 ——
+**那是探测方向错了**，不是参数坏了。要验证 gap 生效必须往**小于帧间隔**的方向调。
+
+### 13.10 本轮发现的一个真实缺陷：`frame_id` 跨 agent 重启会重复
+
+**现象**：真机日志里 `(frame_id=77702, timestamp=2591322)` 后面紧接
+`(frame_id=1, timestamp=700)`，Δ = **−2590622ms** —— agent 重启会让
+`frame_id` 与 `timestamp` **双双归零**。
+
+**影响**：会话切分**不受影响**（按插入序 `id`，且"时间戳倒退 = agent 重启"规则正确切开了），
+但导出文件的 `frames[]` 原先只有 `frame_id` / `timestamp`。下游离线分析（P4 的标定脚本）
+一旦按这两者排序或去重，就会把**两次运行交错**。
+
+**修法**：`HandLogRow` 增加 `id` —— `ai_hand_log` 的自增主键，是这份日志里**唯一
+在日志生命周期内单调**的键。
+
+- `model.go`：`HandLogRow.ID`（注释写明为什么）
+- `repo.go`：导出 SELECT 补 `id` 并 Scan
+- 测试：`TestHandLogRowIDSurvivesAnAgentRestart`（构造"重启前后 `frame_id`/`timestamp`
+  归零"的两段，断言 id 跨重启仍严格递增，且 **id 必须进入导出 JSON** ——
+  只改 Go struct 而没落到文件是这轮最容易漏的一环）；API 侧
+  `TestHandSessionsSplitAndExport` 补同样的断言
+- **不**升 `handSessionFileVersion`：加字段不算 shape 变更（见该常量注释）
+
+### 13.11 仍未验证 / 待补
+
 - `ai_hand_log` 的容量上界只在单测里验过（cap=5 剪到 5 行、最旧先剪）；
   真机默认 cap=100000 到不了，暂无法触发。
+- 真机 `detected=1` 帧的**画面**与 `landmarks` 的像素对齐（overlay 是否会盖准）
+  属于 P3 的活儿，本阶段只验到"数据原样到库、原样出文件"。
 
 
 

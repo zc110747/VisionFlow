@@ -617,7 +617,7 @@ camera-agent 的 AI 分支把检测结果异步 POST 到服务端，与视频流
 | `ai_status` | 每路一行 | 最新心跳（`ai_enable`/`ai_running`/`ai_fps`/`model`/`tracker`/`processed`） |
 | `ai_frame` | 每路一行 | **最新一帧**的帧号、时间戳、分辨率、目标数；`ai-hand` 帧另存 `hand`（JSON 文本） |
 | `ai_object` | 每条目标一行 | 检测明细（`class`/`confidence`/`track_id`/`bbox`），带滚动裁剪 |
-| `ai_hand_log` | 每帧一行 | **append-only 手部录制器**：`detected`/`gesture`/`payload`（agent 原文），带滚动裁剪。见 §10.8 |
+| `ai_hand_log` | 每帧一行 | **append-only 手部录制器**：`id`（唯一单调键）/`detected`/`gesture`/`payload`（agent 原文），带滚动裁剪。见 §10.8 |
 
 `ai_frame` 只留最新帧：监控场景关心"现在画面里有什么"，历史帧由上层日志负责。`ai_object` 按 `retention_rows` 滚动裁剪（默认每路 2000 条），不是每写一次就 DELETE —— 而是每 64 次保存触发一次批量裁剪，避免高频写入被 DELETE 拖慢。
 
@@ -699,7 +699,10 @@ curl -s http://127.0.0.1:8081/api/metadata | python -m json.tool
   2. 相邻两行的 **agent 时钟**（PTS ms）间隔 > `gap_ms` 才切分。
 
   任何 gap 都**跨不过**第 1 条：否则"握住 → 松开 → 再握"会被合并成一次动作。第 2 条用 agent 时钟而不是服务端 `received_at`，因为网络抖动会让重发的 POST 看起来像"手走开又回来"。
-- **导出**：`GET /hand/sessions/{index}` 返回一个自包含文件（`version` / `camera_id` / `exported_at` / `gap_ms` / `session` 摘要 / `frames[]` 含 payload），浏览器直接存成 `hand_session_<cam>_<n>.json`。
+- **导出**：`GET /hand/sessions/{index}` 返回一个自包含文件（`version` / `camera_id` / `exported_at` / `gap_ms` / `session` 摘要 / `frames[]` 含 payload 与 `id`），浏览器直接存成 `hand_session_<cam>_<n>.json`。
+- **`frames[].id` 是唯一的单调键**：`frame_id` 与 `timestamp` 都来自 agent 的时钟，而 agent **每次启动都从零开始** —— 实测真机日志里 `(frame_id=77702,timestamp=2591322)` 后面紧接 `(frame_id=1,timestamp=700)`。离线分析若要排序/去重，只能用 `id`（`ai_hand_log` 自增主键）；按 `frame_id` 排会把两次运行交错。切分本身不受影响，因为它按 `id` 排序。
+- **landmark 可能落在画面外**：`hand.landmarks` 是图像像素，但**不做边界 clamp**（忠实于参考实现；同一函数里 bbox 是 clamp 的）。手贴画面边缘举时，第二级裁切方块伸出边界，落在边界外的点就会算到画面外 —— 实测 `y` 最大 840.96 而画面高 720（腕点本身就 `y=742~756`）。前端 overlay 不能假设 `landmark ∈ [0,w]×[0,h]`。
+- **`gap_ms` 往小调才生效**：真机相邻 hand 行的 `timestamp` 间隔 p50 ≈ 128ms（≈8 fps），所以任何 `gap_ms >= 200` 都会桥接整段 hold。实测（同一份日志）：`gap_ms=30 → 2193` 会话、`=128 → 697`、`=200 → 195`、`=1000 → 194`。
 - **容量**：默认每路 10 万行（8 fps 下约 3.5 小时），最旧先剪；标定前用 `DELETE /hand/log` 清干净比"靠容量滚掉"可靠。
 
 ```bash
