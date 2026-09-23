@@ -292,6 +292,12 @@ func TestHandSessionExportIsADownloadableFile(t *testing.T) {
 	if file.Frames[0].Hand == nil || file.Frames[0].Hand.Gesture != metadata.GestureOpenPalm {
 		t.Errorf("exported frame 0 = %+v, want a hand block with OPEN_PALM", file.Frames[0])
 	}
+	// Keyed on the recorder's id, not on frame_id: the agent restarts frame_id
+	// from 1 on every launch, so a reader sorting on it interleaves runs.
+	if file.Frames[0].ID == 0 || file.Frames[0].ID >= file.Frames[1].ID {
+		t.Errorf("exported frame ids = %d,%d, want non-zero and increasing",
+			file.Frames[0].ID, file.Frames[1].ID)
+	}
 	if file.ExportedAt.IsZero() {
 		t.Error("exported_at must be set so a saved file says when it was taken")
 	}

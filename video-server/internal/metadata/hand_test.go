@@ -337,6 +337,65 @@ func TestHandSessionsSplitAndExport(t *testing.T) {
 	}
 }
 
+// The agent restarts its frame_id and timestamp from zero on every launch, so
+// neither is a key an offline reader can sort or join on. Observed on the real
+// rig: (frame_id=77702,timestamp=2591322) is immediately followed by
+// (frame_id=1,timestamp=700). The recorder's own id is the only monotonic one,
+// and it has to reach the exported file rather than stopping at the Go struct -
+// P4's offline analysis reads the file, not the struct.
+func TestHandLogRowIDSurvivesAnAgentRestart(t *testing.T) {
+	r := newTestRepo(t, 100)
+
+	// Run 1, then a relaunch: the agent's clocks reset, the recorder's does not.
+	saveHandFrame(t, r, "camera01", 900, 900000, true, GestureFist)
+	saveHandFrame(t, r, "camera01", 901, 900125, true, GestureFist)
+	saveHandFrame(t, r, "camera01", 1, 700, true, GestureOpenPalm)
+	saveHandFrame(t, r, "camera01", 2, 825, true, GestureOpenPalm)
+
+	list, err := r.HandSessions("camera01", 1000)
+	if err != nil {
+		t.Fatalf("HandSessions: %v", err)
+	}
+	if len(list.Sessions) != 2 {
+		t.Fatalf("sessions = %d, want 2 (a rewound clock starts a new run)", len(list.Sessions))
+	}
+
+	_, first, err := r.HandSessionRows("camera01", 1, 1000)
+	if err != nil {
+		t.Fatalf("HandSessionRows(1): %v", err)
+	}
+	_, second, err := r.HandSessionRows("camera01", 2, 1000)
+	if err != nil {
+		t.Fatalf("HandSessionRows(2): %v", err)
+	}
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("exported %d and %d rows, want 2 and 2", len(first), len(second))
+	}
+	if first[0].ID == 0 || first[1].ID == 0 {
+		t.Fatal("rows were exported without the recorder id")
+	}
+	// Only id orders these two runs: frame_id reads 900,901 then 1,2, and
+	// timestamp reads 900000,900125 then 700,825 - i.e. "then" looks earlier.
+	if first[1].ID >= second[0].ID {
+		t.Errorf("ids %d then %d are not ordered across the restart", first[1].ID, second[0].ID)
+	}
+	if second[0].ID >= second[1].ID {
+		t.Errorf("ids %d then %d are not increasing within a run", second[0].ID, second[1].ID)
+	}
+
+	file := HandSessionFile{
+		Version: 1, CameraID: "camera01",
+		Session: list.Sessions[1], GapMS: 1000, Frames: second,
+	}
+	raw, err := json.Marshal(file)
+	if err != nil {
+		t.Fatalf("marshal export: %v", err)
+	}
+	if !strings.Contains(string(raw), `"id":`) {
+		t.Errorf("the export dropped the only monotonic key: %s", raw)
+	}
+}
+
 // The split rule is pure logic over the row list, so it is pinned directly
 // rather than only through the database.
 func TestSplitHandSessionsBoundaries(t *testing.T) {

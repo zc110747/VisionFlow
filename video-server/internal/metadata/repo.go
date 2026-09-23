@@ -734,7 +734,7 @@ func (r *Repository) handLogRows(cameraID string, firstID, lastID int64) ([]Hand
 	if err := dbutil.RetryOnBusy(3, func() error {
 		var e error
 		rows, e = r.db.Query(`
-			SELECT frame_id,timestamp,detected,gesture,payload,received_at
+			SELECT id,frame_id,timestamp,detected,gesture,payload,received_at
 			FROM ai_hand_log
 			WHERE camera_id = ? AND id BETWEEN ? AND ?
 			ORDER BY id`, cameraID, firstID, lastID)
@@ -753,7 +753,7 @@ func (r *Repository) handLogRows(cameraID string, firstID, lastID int64) ([]Hand
 			payload  string
 			received string
 		)
-		if err := rows.Scan(&row.FrameID, &row.Timestamp, &detected, &gesture,
+		if err := rows.Scan(&row.ID, &row.FrameID, &row.Timestamp, &detected, &gesture,
 			&payload, &received); err != nil {
 			return nil, fmt.Errorf("scan ai_hand_log row: %w", err)
 		}

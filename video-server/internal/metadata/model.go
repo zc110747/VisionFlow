@@ -463,6 +463,14 @@ type Snapshot struct {
 
 // HandLogRow is one recorded ai-hand frame, as exported.
 type HandLogRow struct {
+	// ID is the recorder's own append-only key, and the ONLY field here that is
+	// monotonic for the life of the log. frame_id and timestamp are the agent's
+	// clock, and it restarts from zero on every agent launch: a real 33-minute
+	// capture contained (frame_id=77702, timestamp=2591322) immediately followed
+	// by (frame_id=1, timestamp=700). An offline reader that sorts or de-dupes
+	// on either of those silently interleaves two runs, so the export carries
+	// the key that cannot do that.
+	ID         int64     `json:"id"`
 	FrameID    int64     `json:"frame_id"`
 	Timestamp  int64     `json:"timestamp"`
 	ReceivedAt time.Time `json:"received_at"`
