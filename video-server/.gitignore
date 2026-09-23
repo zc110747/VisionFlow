@@ -6,6 +6,8 @@
 # Frontend
 web/node_modules/
 web/dist/
+# scratch dir written by web/tools/check-sfc.mjs on every run
+web/.sfc-check/
 
 # Runtime data
 /data/
