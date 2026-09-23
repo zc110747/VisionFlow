@@ -59,6 +59,7 @@ cd carmera-agent && ctest --test-dir build-msvc --output-on-failure   # 29 个�
 | **"视频正常但 AI 不显示"排查顺序** / 二进制过旧判定 | §4 |
 | 9/4 merge 冲突残留事件与教训 | §5 |
 | **根 `start.bat` 用法 + 多摄像头结论 + AI 能力选择缺口（方案 A/B/C）** | §6 |
+| **手部 3D 识别分支**（模型/anchor 表/两个 z 的语义/黄金基准/实测成绩/构建 env） | §7 |
 
 ## 交付约定
 

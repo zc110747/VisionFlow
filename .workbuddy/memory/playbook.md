@@ -160,3 +160,54 @@ start.bat --source videotestsrc --no-browser --no-pause --probe
 需要同时改 agent（`metadata_encoder` / `AIStatusInfo`）+ server（repo/handlers）+ web。
 **方案 C（握手注册）**：agent 启动 POST `/capabilities`，`POST aimode` 对不支持的模式回 409。
 必备共同项：`POST /aimode` 对不支持的模式返回 4xx（而不是静默 200）+ UI 默认置灰。
+
+---
+
+## §7 手部 3D 识别分支（2026-09-23，P1a–P1c 已提交 `5eeee73`）
+
+### 7.1 模型与几何（**改这些数字前先读 `carmera-agent/models/README.md`**）
+
+两级级联：`palm_detection_mediapipe_2023feb.onnx`（NHWC 192²，2016 anchor）
+→ 按掌心 7 点算旋转 → 裁 224² → `handpose_estimation_mediapipe_2023feb.onnx`（21 点 + handedness）。
+两个模型已入库，Apache-2.0，SHA-256 在 `models/README.md`。
+
+**anchor 表是最高风险项**（模型不内嵌，运行时必须同序生成，错了静默出垃圾框）：
+```
+idx    0..1151  stride 8  24×24 网格 × 2 锚/格
+idx 1152..2015  stride 16 12×12 网格 × 6 锚/格
+循环序 for y -> for x -> for k；中心 ((x+0.5)/grid, (y+0.5)/grid)
+```
+全 2016 值由 `tests/golden/palm_anchors_reference.txt`（**独立誊抄**官方字面量）钉死。
+
+### 7.2 两个"z"的语义（实测，不是假设）
+
+| 量 | 含义 | 用在哪 |
+|---|---|---|
+| `landmark.z` | **手腕相对**深度，手腕恒为 0（实测 1.8e-06），描述手指**朝向** | 手势几何辅助 |
+| 手部 bbox 几何均值 `/frame_h` | **离相机远近**，单调 | logical Y = FORWARD/BACKWARD |
+
+→ `HandConfig::depth_source` 默认 `"size"`，`"landmark_z"` 保留做 §16 实验对比。
+
+### 7.3 验收与判据
+
+```bash
+# 单测（44 个，其中 11 个无模型也能跑）
+./build-msvc/tests/camera-agent-tests.exe
+ctest --test-dir build-msvc --output-on-failure
+```
+实测成绩（与官方参考同 ORT 后端）：21 点 **dx 0.00034 / dy 0.00079 / dz 0.00173 px**、
+bbox 0.00065 px、anchor 选择逐位相同。详见 `tests/golden/README.md`。
+
+**唯一还没实测的数字**：`kCurledRatio = 0.90`（握拳侧）。夹具里没有握拳样本，
+必须真机补一张 fist 图才能定 —— 这是显式标注的未验证项。
+
+### 7.4 坑（本项目专属，方法论已升级到全局 playbook §11）
+
+1. **夹具必须 PNG。** JPEG 下 stb_image 与 libjpeg-turbo 差 3 LSB/5% 像素，
+   残差被抬到 0.43 px，比真实误差大 250 倍。
+2. **官方 `_preprocess` 的 `pad_bias` 在 `if` 分支内赋值**，誊抄漏了 → 基准脚本自己错、
+   每个框偏移 +160 px，看起来像"网络选错了手"。**差分对不上先怀疑基准。**
+3. **构建环境**：`cmd.exe` 中转被沙箱拒（全局 §3.2），跑 .bat 只能
+   `./build_oneclick.bat --no-pause < /dev/null`；要精确控制 target 或 `grep` 零警告，
+   用手工 MSVC env（全局 §7.4），注意 **Debug 首配需要 SDK 的 `rc.exe`/`mt.exe`**。
+   `build_oneclick.bat` 默认后端 = gstreamer，与现有 `build-msvc` 一致。
