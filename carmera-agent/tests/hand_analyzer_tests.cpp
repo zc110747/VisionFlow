@@ -217,10 +217,12 @@ TEST(hand_gesture_real_capture_open_and_fist) {
     ASSERT_EQ(o.g, ca::Gesture::OpenPalm);
     ASSERT(std::fabs(o.confidence - 1.0f) < 1e-6f);   // all four fingers agree
 
-    // steady FIST - ratios 1.3171 / 0.9154 / 0.8268 / 0.9026
-    // The index stays EXTENDED (see the KNOWN LIMITATION note in
-    // hand_analyzer.cpp: MCP 5 is the knuckle nearest the wrist).  The gesture
-    // therefore rides on the other three and lands exactly on kGestureVote.
+    // steady FIST (a LOOSE one) - ratios 1.3171 / 0.9154 / 0.8268 / 0.9026
+    // Here the index votes EXTENDED; on a tighter fist of the same hand it
+    // votes curled instead (0.614-1.971, measured later).  The index is the one
+    // unreliable finger; middle/ring/pinky carry the gesture, so the vote lands
+    // exactly on kGestureVote.  See the KNOWN LIMITATION note in
+    // hand_analyzer.cpp.
     static const float kFist[21][3] = {
         {1037.29f, 624.99f,   0.00f}, {1023.49f, 535.79f,   0.99f}, {992.62f, 465.95f,  -6.14f},
         { 962.16f, 428.01f, -17.80f}, { 931.99f, 425.56f, -29.40f}, {896.69f, 485.57f,   0.43f},

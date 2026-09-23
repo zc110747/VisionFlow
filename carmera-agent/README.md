@@ -440,7 +440,7 @@ start.bat --ai-mode hand        # 联合运行（server + agent）直接以手�
 | 项 | 状态 |
 |---|---|
 | `kCurledRatio = 1.10`（握拳侧阈值） | **已实测**（2026-09-23，真机 LRCP USB2.0）。原先的 0.90 是未验证的占位值，实测发现它落在**真实握拳簇内部** —— 真握拳的 middle 指会冲到 0.983，导致四指里只有 2 指投 curled、拿不到 0.75 票，**14 帧真握拳里有 11 帧输出 `UNKNOWN`**。现取值 1.10：比握拳簇高 0.117、比开掌簇低 0.329，且仍在 `kExtendedRatio`(1.15) 之下。回归用例 `hand_gesture_real_capture_open_and_fist` 用本次实测的 landmark 逐位钉住 |
-| **index 指在握拳时从不投 curled** | **已知几何限制，非标定问题**。MCP5 是四指里离腕点最近的，故握拳时 index 比值仍在 1.2–1.4（> `kExtendedRatio`），反而投 extended。**FIST 实际只靠 middle/ring/pinky 三指，且恰好卡在 `kGestureVote=0.75` 的等号上** ⇒ 这三指若有一指被遮挡，手势就会丢失。根治需要按手指归一化（或用 PIP/DIP 关节），属分类器改动，Phase 1 不做 |
+| **index 指是四指里最不可靠的一个** | **已知几何限制，非标定问题**。MCP5 是四指里离腕点最近的，同样的卷曲程度下 index 比值天生偏高。**同一只手的两次握拳实测：松拳 1.222–1.398（> `kExtendedRatio`，反而投 extended）、紧拳 0.614–1.971（中位 0.829，多数投 curled）** ⇒ index 是唯一跨越两个阈值的指头，"怎么握就怎么投"。而 middle/ring/pinky 两次都 ≤ 0.983，是可靠的三指。**FIST 实际只靠这三指，且恰好卡在 `kGestureVote=0.75` 的等号上** ⇒ 这三指若有一指被遮挡，手势就会丢失。根治需要按手指归一化（或用 PIP/DIP 关节），属分类器改动，Phase 1 不做 |
 | `depth_source` 的方向（哪个符号是"靠近"） | **待真机实验**（`--ai-hand-depth` 可切换两种来源对比） |
 | 真实 UVC 摄像头的 `invert_*` 取值 | **待真机实验**（`--ai-hand-invert-x/-y/-z`） |
 | 画面疑似整体旋转 90° | **待确认**（真机帧里天花板灯板出现在画面左侧、玻璃隔断在右侧）。这会影响 §17 logical 坐标系与 P3 前端 overlay 朝向 |

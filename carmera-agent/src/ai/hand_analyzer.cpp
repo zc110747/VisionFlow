@@ -45,14 +45,19 @@ namespace {
 // if/else-if, so the dead band IS [kCurledRatio, kExtendedRatio]. Letting the
 // two cross would silently void that band instead of failing loudly.
 //
-// KNOWN LIMITATION, geometry, not tuning: the INDEX finger never votes curled.
-// MCP 5 is the knuckle closest to the wrist, so even in a tight fist the index
-// ratio stays ~1.2-1.4 (above kExtendedRatio) and it votes EXTENDED instead.
-// FIST therefore rides on exactly three fingers (middle/ring/pinky) always
-// agreeing, i.e. on the 0.75 vote being met at equality. Occluding any one of
-// those three will lose the gesture. Fixing that needs a finger-specific
-// baseline (or the PIP/DIP joints), which is a classifier change, not a
-// threshold change - deliberately out of scope for Phase 1.
+// KNOWN LIMITATION: the INDEX finger is the least reliable of the four, and it
+// is the only one whose range straddles the thresholds. MCP 5 is the knuckle
+// closest to the wrist, so for the same amount of curl the index ratio sits
+// higher than the other three. Across two live holds of the SAME hand it went
+// 1.222-1.398 on a loose fist (above kExtendedRatio -> it voted EXTENDED) and
+// 0.614-1.971 (median 0.829) on a tight one (mostly curled). So it is not that
+// the index "never" votes curled - it is that it votes whichever way the fist
+// happens to be held. The other three ARE dependable: middle / ring / pinky
+// stayed <= 0.983 on both holds. FIST therefore rides on that trio, which means
+// the vote is met at EQUALITY (3 of 4 = 0.75) and occluding any one of those
+// three loses the gesture. A finger-specific baseline - or the PIP/DIP joints -
+// would fix it; that is a classifier change, deliberately out of scope for
+// Phase 1.
 constexpr float kExtendedRatio = 1.15f;
 constexpr float kCurledRatio   = 1.10f;
 
