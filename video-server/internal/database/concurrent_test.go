@@ -36,7 +36,7 @@ func TestConcurrentReadWriteNoSQLITEBUSY(t *testing.T) {
 		t.Fatalf("expected WAL journal mode after Open, got %q (fix precondition missing)", mode)
 	}
 
-	meta := metadata.NewRepository(db, 0, 1)
+	meta := metadata.NewRepository(db, metadata.Options{})
 	cam := camera.NewRepository(db)
 	if err := cam.Create(camera.Camera{
 		ID: "camera01", StreamPath: "camera01", Status: camera.StatusOnline,

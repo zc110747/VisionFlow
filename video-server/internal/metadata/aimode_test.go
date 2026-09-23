@@ -199,7 +199,7 @@ func TestMigrateAddsKeypointsColumnToExistingDB(t *testing.T) {
 		t.Fatalf("Migrate on legacy db: %v", err)
 	}
 
-	r := NewRepository(db, 0, 1)
+	r := NewRepository(db, Options{})
 	f := sampleFrame("camera01", 15230)
 	f.Objects = []Object{{
 		Class: "person", Confidence: 0.91, TrackID: 7, BBox: [4]int{100, 200, 300, 500},
@@ -253,7 +253,7 @@ func TestMigrateAddsAIModeColumnToExistingDB(t *testing.T) {
 		t.Fatalf("Migrate on legacy db: %v", err)
 	}
 
-	r := NewRepository(db, 0, 1)
+	r := NewRepository(db, Options{})
 	f := sampleFrame("camera01", 15230)
 	f.AIMode = AIModePose
 	if err := r.SaveFrame(f, time.Unix(1700000000, 0).UTC()); err != nil {

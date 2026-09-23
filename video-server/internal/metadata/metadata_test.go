@@ -15,8 +15,18 @@ import (
 // A FILE (not ":memory:") is used on purpose: database/sql keeps a connection
 // pool, and with an in-memory DSN each new connection would get its own empty
 // database, making the tests pass for the wrong reason.
-func newTestRepo(t *testing.T, retention int) *Repository {
+func newTestRepo(t *testing.T, handLogCap int) *Repository {
 	t.Helper()
+	return newTestRepoOpts(t, Options{HandLogMaxRows: handLogCap, HandLogPruneEvery: 1})
+}
+
+// newTestRepoOpts is newTestRepo for tests that need to vary the recorder
+// options rather than just its cap.
+func newTestRepoOpts(t *testing.T, opts Options) *Repository {
+	t.Helper()
+	if opts.HandLogPruneEvery == 0 {
+		opts.HandLogPruneEvery = 1
+	}
 	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "test.db")+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -29,7 +39,13 @@ func newTestRepo(t *testing.T, retention int) *Repository {
 		t.Fatalf("migrate: %v", err)
 	}
 	// pruneEvery=1 so pruning behaviour is exercised deterministically.
-	return NewRepository(db, retention, 1)
+	//
+	// The first argument used to bound ai_object history; that history is gone
+	// (ai_object holds only the latest frame now), so it bounds ai_hand_log
+	// instead. Every pre-existing caller passes 0, which means "recorder off" -
+	// the same thing it meant before, so those tests keep testing what they
+	// were written to test.
+	return NewRepository(db, opts)
 }
 
 func sampleFrame(cam string, frameID int64) *FrameMessage {

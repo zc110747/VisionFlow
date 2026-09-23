@@ -28,7 +28,7 @@ func newTestHandler(t *testing.T) *Handler {
 	if err := metadata.Migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	meta := metadata.NewRepository(db, 0, 1)
+	meta := metadata.NewRepository(db, metadata.Options{})
 	return New(nil, nil, nil, db, meta)
 }
 

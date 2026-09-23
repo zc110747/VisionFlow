@@ -43,6 +43,28 @@ type MetadataConfig struct {
 	// the camera row exists, and rejecting it would only make the agent
 	// needlessly back off and drop frames.
 	RequireKnownCamera bool `yaml:"require_known_camera"`
+
+	// HandLogMaxRows bounds the append-only ai_hand_log table (the hand-side
+	// recorder). ai-hand frames arrive at the agent's ai.fps - 8/s with the
+	// shipped config - so this table grows by roughly 29k rows/hour and
+	// 690k rows/day if nothing prunes it. Oldest rows are pruned first.
+	// <= 0 keeps every row, which WILL grow without bound; that is only
+	// sensible for a short experiment.
+	HandLogMaxRows int `yaml:"hand_log_max_rows"`
+	// HandLogPruneEvery is how many appends happen between prune passes.
+	// Pruning on every frame would add a write transaction per inference to
+	// buy nothing; a small batch keeps the table at its cap just as well.
+	HandLogPruneEvery int `yaml:"hand_log_prune_every"`
+	// HandLogDetectedOnly stores only frames in which a hand was actually
+	// found. false (the default) keeps the log lossless: the gaps between
+	// detections are data too, they are what says where the hand left.
+	HandLogDetectedOnly bool `yaml:"hand_log_detected_only"`
+	// HandSessionGapMS splits the log into sessions for export: two stored
+	// rows further apart than this belong to different sessions, so one
+	// recording run of "hold a fist, drop it, hold a palm" exports as two.
+	// It describes the ANALYSIS rather than the recording, which is why the
+	// export endpoint accepts a per-request override.
+	HandSessionGapMS int `yaml:"hand_session_gap_ms"`
 }
 
 type ServerConfig struct {
@@ -124,6 +146,14 @@ func Default() *Config {
 			RetentionRows:      2000,
 			MaxBodyBytes:       1 << 20, // 1 MiB
 			RequireKnownCamera: false,
+			// ~100k rows cap: at 8 ai-hand frames/s that is a bit over 3 hours
+			// of continuous recording, and a few tens of MB with landmarks on.
+			// Long enough for a calibration or an axis experiment, short enough
+			// that a forgotten rig does not fill the disk.
+			HandLogMaxRows:      100000,
+			HandLogPruneEvery:   256,
+			HandLogDetectedOnly: false,
+			HandSessionGapMS:    1000,
 		},
 		Log: LogConfig{Level: "info"},
 	}

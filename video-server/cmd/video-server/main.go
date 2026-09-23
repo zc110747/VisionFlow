@@ -83,7 +83,11 @@ func main() {
 	repo := camera.NewRepository(db)
 	// Metadata repo shares the same SQLite handle, so cameras and their AI
 	// results can never drift apart across a backup/restore.
-	meta := metadata.NewRepository(db, cfg.Metadata.RetentionRows, 0)
+	meta := metadata.NewRepository(db, metadata.Options{
+		HandLogMaxRows:      cfg.Metadata.HandLogMaxRows,
+		HandLogPruneEvery:   cfg.Metadata.HandLogPruneEvery,
+		HandLogDetectedOnly: cfg.Metadata.HandLogDetectedOnly,
+	})
 	mtx := mediamtx.New(cfg)
 	mon := monitor.New(repo, mtx, cfg)
 	srv := server.New(cfg, db, repo, meta, mtx, mon)

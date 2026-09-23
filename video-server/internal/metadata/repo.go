@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"video-server/internal/dbutil"
@@ -23,15 +24,39 @@ import (
 // is replaced (delete + insert) on every frame so a reused frame_id - the agent
 // counter resets across restarts - can never return a stale prior run's objects
 // (e.g. pose skeletons leaking into person-detect mode).
-type Repository struct {
-	db *sql.DB
+// Options tunes what the repository keeps.
+//
+// The zero value is valid and means "no hand recorder": HandLogMaxRows <= 0
+// turns ai_hand_log off. That keeps every existing test and call site working
+// unchanged, and makes the recorder opt-in at the one place that has the
+// config in hand (cmd/video-server/main.go).
+type Options struct {
+	// HandLogMaxRows caps the append-only ai_hand_log table. Rows past the cap
+	// are pruned oldest-first. <= 0 disables the recorder entirely.
+	HandLogMaxRows int
+	// HandLogPruneEvery is how many appends happen between prune passes;
+	// <= 0 falls back to defaultHandPruneEvery.
+	HandLogPruneEvery int
+	// HandLogDetectedOnly records only frames in which a hand was found.
+	HandLogDetectedOnly bool
 }
 
-// NewRepository builds a metadata repository. The retention/pruneEvery args are
-// retained only for call-site compatibility; ai_object now holds just the latest
-// frame's objects, so no history or pruning is kept.
-func NewRepository(db *sql.DB, _ /*retention*/, _ /*pruneEvery*/ int) *Repository {
-	return &Repository{db: db}
+// defaultHandPruneEvery balances "the table sits at its cap" against "a write
+// transaction per inference". At 8 ai-hand frames/s this prunes about every
+// 32 seconds, which is far more often than the cap can be exceeded by.
+const defaultHandPruneEvery = 256
+
+type Repository struct {
+	db   *sql.DB
+	opts Options
+	// appends counts hand-log inserts since the last prune. Atomic because
+	// SaveFrame runs on the HTTP handler goroutines, concurrently.
+	appends atomic.Int64
+}
+
+// NewRepository builds a metadata repository.
+func NewRepository(db *sql.DB, opts Options) *Repository {
+	return &Repository{db: db, opts: opts}
 }
 
 // Migrate creates the metadata tables. It is called from the shared schema
@@ -86,6 +111,32 @@ func Migrate(db *sql.DB) error {
 		)`,
 		// Serves the latest-frame lookup.
 		`CREATE INDEX IF NOT EXISTS idx_ai_object_camera_id ON ai_object(camera_id, id)`,
+
+		// ---- hand recorder (Phase 1) ------------------------------------
+		// The ONE append-only table in this schema. Everything above keeps only
+		// the latest value per camera because the web polls it at 5 Hz and must
+		// never scan a growing history; ai_hand_log is the deliberate opposite:
+		// it is written once per ai-hand frame and never updated, because its
+		// whole purpose is offline analysis (threshold recalibration, the axis
+		// direction experiment) where the sequence IS the data.
+		//
+		// payload holds the agent's "hand" object verbatim, so a field added by
+		// a later agent phase survives storage without a server release. Only
+		// the two columns needed to segment and filter (frame_id, timestamp,
+		// detected, gesture) are promoted out of it.
+		`CREATE TABLE IF NOT EXISTS ai_hand_log (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			camera_id   TEXT    NOT NULL,
+			frame_id    INTEGER NOT NULL,
+			timestamp   INTEGER NOT NULL,
+			detected    INTEGER NOT NULL DEFAULT 0,
+			gesture     TEXT,
+			payload     TEXT    NOT NULL,
+			received_at TEXT    NOT NULL
+		)`,
+		// Serves both the session scan (ordered by id within a camera) and the
+		// oldest-first prune.
+		`CREATE INDEX IF NOT EXISTS idx_ai_hand_log_cam_id ON ai_hand_log(camera_id, id)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
@@ -104,6 +155,11 @@ func Migrate(db *sql.DB) error {
 	// Same forward-compat for the per-frame AI mode column introduced to let
 	// the web drop transition frames: older joint DBs have ai_frame without it.
 	if err := addColumnIfMissing(db, "ai_frame", "ai_mode", "TEXT"); err != nil {
+		return err
+	}
+	// And for the hand block, introduced with ai-hand mode. Stored as the
+	// agent's verbatim JSON so GET /metadata can hand it to the web unchanged.
+	if err := addColumnIfMissing(db, "ai_frame", "hand", "TEXT"); err != nil {
 		return err
 	}
 	return nil
@@ -158,6 +214,21 @@ func (r *Repository) saveFrameOnce(f *FrameMessage, received time.Time) error {
 	now := received.UTC().Format(timeFmt)
 	recv := now
 
+	// Encode the hand block once, for two destinations. HandState.MarshalJSON
+	// returns the agent's own bytes, so this is a copy, not a re-serialisation.
+	var handJSON []byte
+	if f.Hand != nil {
+		b, merr := json.Marshal(f.Hand)
+		if merr != nil {
+			// Not fatal: the frame itself is still worth storing, and losing a
+			// malformed sub-object must not drop the objects alongside it.
+			logger.Warn("metadata %s: cannot encode hand block (frame %d): %v",
+				f.CameraID, f.FrameID, merr)
+		} else {
+			handJSON = b
+		}
+	}
+
 	tx, err := r.db.Begin()
 	if err != nil {
 		return err
@@ -165,16 +236,17 @@ func (r *Repository) saveFrameOnce(f *FrameMessage, received time.Time) error {
 	defer tx.Rollback()
 
 	if _, err := tx.Exec(`
-		INSERT INTO ai_frame (camera_id,frame_id,timestamp,video_width,video_height,ai_mode,object_count,received_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?)
+		INSERT INTO ai_frame (camera_id,frame_id,timestamp,video_width,video_height,ai_mode,object_count,hand,received_at,updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(camera_id) DO UPDATE SET
 			frame_id=excluded.frame_id, timestamp=excluded.timestamp,
 			video_width=excluded.video_width, video_height=excluded.video_height,
 			ai_mode=excluded.ai_mode,
 			object_count=excluded.object_count,
+			hand=excluded.hand,
 			received_at=excluded.received_at, updated_at=excluded.updated_at`,
 		f.CameraID, f.FrameID, f.Timestamp, f.VideoWidth, f.VideoHeight,
-		f.AIMode, len(f.Objects), recv, now); err != nil {
+		f.AIMode, len(f.Objects), nullBytes(handJSON), recv, now); err != nil {
 		return fmt.Errorf("upsert ai_frame: %w", err)
 	}
 
@@ -210,10 +282,71 @@ func (r *Repository) saveFrameOnce(f *FrameMessage, received time.Time) error {
 		}
 	}
 
+	// ---- hand recorder (append-only) ----
+	// Same transaction as the latest-frame row on purpose: a frame that reached
+	// the web but not the log (or the reverse) would give the operator two
+	// different answers to "what did the agent send at frame N?".
+	if len(handJSON) > 0 && r.handLogEnabled() {
+		if !r.opts.HandLogDetectedOnly || f.Hand.Detected {
+			if _, err := tx.Exec(`
+				INSERT INTO ai_hand_log
+					(camera_id,frame_id,timestamp,detected,gesture,payload,received_at)
+				VALUES (?,?,?,?,?,?,?)`,
+				f.CameraID, f.FrameID, f.Timestamp, boolInt(f.Hand.Detected),
+				nullStr(f.Hand.Gesture), string(handJSON), recv); err != nil {
+				return fmt.Errorf("insert ai_hand_log: %w", err)
+			}
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit frame: %w", err)
 	}
+	// Best-effort and outside the transaction: a prune failure costs table
+	// growth, never an ingest failure.
+	r.maybePruneHandLog(f.CameraID)
 	return nil
+}
+
+// handLogEnabled reports whether the recorder is on. Off means "no rows are
+// appended"; ai_frame.hand is still written either way, because the web reads
+// the latest hand state from there regardless of whether history is kept.
+func (r *Repository) handLogEnabled() bool { return r.opts.HandLogMaxRows > 0 }
+
+// maybePruneHandLog drops the oldest rows once the camera's log passes
+// HandLogMaxRows, at most once every HandLogPruneEvery appends.
+//
+// Pruning on every frame would add a write transaction per inference to buy
+// nothing; batching means the table can overshoot the cap by at most one batch.
+// The counter is advanced before the work, so a persistently failing prune
+// degrades to "the log grows" instead of "a prune attempt on every frame".
+func (r *Repository) maybePruneHandLog(cameraID string) {
+	maxRows := r.opts.HandLogMaxRows
+	if maxRows <= 0 {
+		return
+	}
+	every := r.opts.HandLogPruneEvery
+	if every <= 0 {
+		every = defaultHandPruneEvery
+	}
+	if r.appends.Add(1) < int64(every) {
+		return
+	}
+	r.appends.Store(0)
+	if err := dbutil.RetryOnBusy(3, func() error {
+		// MAX(id) is NULL on an empty table, and the subtraction goes negative
+		// while the log is under the cap; "id <= NULL" and "id <= -n" are both
+		// never true, so the under-cap case deletes nothing rather than needing
+		// a COUNT first.
+		_, e := r.db.Exec(`
+			DELETE FROM ai_hand_log
+			WHERE camera_id = ?
+			  AND id <= (SELECT MAX(id) FROM ai_hand_log WHERE camera_id = ?) - ?`,
+			cameraID, cameraID, maxRows)
+		return e
+	}); err != nil {
+		logger.Warn("metadata %s: prune ai_hand_log: %v", cameraID, err)
+	}
 }
 
 // SaveStatus stores one AI heartbeat (latest per camera). Retried on transient
@@ -254,13 +387,14 @@ func (r *Repository) Latest(cameraID string) (Snapshot, error) {
 		frameID, ts    int64
 		w, h, objCount int
 		aiMode         string
+		handJSON       sql.NullString
 		receivedAt     string
 	)
 	err := dbutil.RetryOnBusy(3, func() error {
 		return r.db.QueryRow(`
-			SELECT frame_id,timestamp,video_width,video_height,ai_mode,object_count,received_at
+			SELECT frame_id,timestamp,video_width,video_height,ai_mode,object_count,hand,received_at
 			FROM ai_frame WHERE camera_id = ?`, cameraID).
-			Scan(&frameID, &ts, &w, &h, &aiMode, &objCount, &receivedAt)
+			Scan(&frameID, &ts, &w, &h, &aiMode, &objCount, &handJSON, &receivedAt)
 	})
 	switch {
 	case err == nil:
@@ -277,6 +411,7 @@ func (r *Repository) Latest(cameraID string) (Snapshot, error) {
 			ObjectCount: objCount,
 			ReceivedAt:  parseTime(receivedAt),
 			Objects:     objs,
+			Hand:        decodeHand(handJSON),
 		}
 	case err == sql.ErrNoRows:
 		// no frames yet - fall through, status may still exist
@@ -493,4 +628,244 @@ func parseTime(s string) time.Time {
 		return t
 	}
 	return time.Time{}
+}
+
+// ---------------------------------------------------------------------------
+// hand recorder (Phase 1): read side
+// ---------------------------------------------------------------------------
+
+// DefaultHandSessionGapMS splits a recording when the agent clock jumps by more
+// than a second between stored frames. The agent writes ~8 frames/s, so this is
+// about eight missed frames - far longer than a stall, far shorter than getting
+// up and sitting back down.
+const DefaultHandSessionGapMS = 1000
+
+// handLogMeta is one log row WITHOUT its payload. Sessions are discovered on
+// this projection alone, so listing them never loads the (much larger) hand
+// blocks of a log that may hold 100k rows.
+type handLogMeta struct {
+	id        int64
+	frameID   int64
+	timestamp int64
+	detected  bool
+	gesture   string
+}
+
+// handSessionRun is a session plus the row ids bounding it. The exporter needs
+// those ids to fetch exactly this session's payloads in a second query instead
+// of loading the whole log.
+type handSessionRun struct {
+	firstID, lastID int64
+	session         HandSession
+}
+
+// HandSessions lists the recorded sessions of a camera in arrival order.
+func (r *Repository) HandSessions(cameraID string, gapMS int) (HandSessionList, error) {
+	out := HandSessionList{CameraID: cameraID, GapMS: effectiveGap(gapMS), Sessions: []HandSession{}}
+	meta, err := r.handLogMeta(cameraID)
+	if err != nil {
+		return out, err
+	}
+	out.TotalRows = len(meta)
+	for _, run := range splitHandSessions(meta, gapMS) {
+		out.Sessions = append(out.Sessions, run.session)
+	}
+	return out, nil
+}
+
+// HandSessionRows returns one session plus every frame in it, payloads included.
+// index is 1-based, matching the "index" the list endpoint reports.
+func (r *Repository) HandSessionRows(cameraID string, index, gapMS int) (HandSession, []HandLogRow, error) {
+	meta, err := r.handLogMeta(cameraID)
+	if err != nil {
+		return HandSession{}, nil, err
+	}
+	runs := splitHandSessions(meta, gapMS)
+	if index < 1 || index > len(runs) {
+		return HandSession{}, nil, ErrNoSuchSession
+	}
+	run := runs[index-1]
+	rows, err := r.handLogRows(cameraID, run.firstID, run.lastID)
+	if err != nil {
+		return HandSession{}, nil, err
+	}
+	return run.session, rows, nil
+}
+
+// ErrNoSuchSession is returned for an index the list endpoint never reported -
+// including the empty log, where every index is out of range.
+var ErrNoSuchSession = fmt.Errorf("no such hand session")
+
+func (r *Repository) handLogMeta(cameraID string) ([]handLogMeta, error) {
+	var rows *sql.Rows
+	if err := dbutil.RetryOnBusy(3, func() error {
+		var e error
+		rows, e = r.db.Query(`
+			SELECT id,frame_id,timestamp,detected,gesture
+			FROM ai_hand_log WHERE camera_id = ? ORDER BY id`, cameraID)
+		return e
+	}); err != nil {
+		return nil, fmt.Errorf("scan ai_hand_log: %w", err)
+	}
+	defer rows.Close()
+
+	var out []handLogMeta
+	for rows.Next() {
+		var (
+			m        handLogMeta
+			detected int
+			gesture  sql.NullString
+		)
+		if err := rows.Scan(&m.id, &m.frameID, &m.timestamp, &detected, &gesture); err != nil {
+			return nil, fmt.Errorf("scan ai_hand_log row: %w", err)
+		}
+		// Scanned as an int rather than a bool: the column is an INTEGER and
+		// relying on the driver to coerce 0/1 into *bool is a behaviour the
+		// tests would pin per driver, not a property of SQLite.
+		m.detected = detected != 0
+		m.gesture = gesture.String
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (r *Repository) handLogRows(cameraID string, firstID, lastID int64) ([]HandLogRow, error) {
+	var rows *sql.Rows
+	if err := dbutil.RetryOnBusy(3, func() error {
+		var e error
+		rows, e = r.db.Query(`
+			SELECT frame_id,timestamp,detected,gesture,payload,received_at
+			FROM ai_hand_log
+			WHERE camera_id = ? AND id BETWEEN ? AND ?
+			ORDER BY id`, cameraID, firstID, lastID)
+		return e
+	}); err != nil {
+		return nil, fmt.Errorf("read ai_hand_log session: %w", err)
+	}
+	defer rows.Close()
+
+	out := []HandLogRow{}
+	for rows.Next() {
+		var (
+			row      HandLogRow
+			detected int
+			gesture  sql.NullString
+			payload  string
+			received string
+		)
+		if err := rows.Scan(&row.FrameID, &row.Timestamp, &detected, &gesture,
+			&payload, &received); err != nil {
+			return nil, fmt.Errorf("scan ai_hand_log row: %w", err)
+		}
+		row.Detected = detected != 0
+		row.Gesture = gesture.String
+		row.Hand = decodeHand(sql.NullString{String: payload, Valid: payload != ""})
+		row.ReceivedAt = parseTime(received)
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// ClearHandLog drops every recorded row for a camera and reports how many went.
+// Needed because the recorder is always on: a calibration run wants a log that
+// starts empty, and the alternative is deleting the whole database file.
+func (r *Repository) ClearHandLog(cameraID string) (int64, error) {
+	var n int64
+	if err := dbutil.RetryOnBusy(3, func() error {
+		res, err := r.db.Exec(`DELETE FROM ai_hand_log WHERE camera_id = ?`, cameraID)
+		if err != nil {
+			return err
+		}
+		n, _ = res.RowsAffected()
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("clear ai_hand_log: %w", err)
+	}
+	r.appends.Store(0)
+	return n, nil
+}
+
+// decodeHand turns a stored hand block back into a HandState. A NULL column (a
+// detect/pose frame, or a frame saved before ai-hand existed) yields nil, which
+// is what a consumer checks to decide whether there is a skeleton to draw.
+func decodeHand(s sql.NullString) *HandState {
+	if !s.Valid || s.String == "" || s.String == "null" {
+		return nil
+	}
+	var h HandState
+	if err := json.Unmarshal([]byte(s.String), &h); err != nil {
+		logger.Warn("metadata: stored hand block does not decode: %v", err)
+		return nil
+	}
+	return &h
+}
+
+func effectiveGap(gapMS int) int {
+	if gapMS <= 0 {
+		return DefaultHandSessionGapMS
+	}
+	return gapMS
+}
+
+// splitHandSessions groups ordered log rows into sessions.
+//
+// A session is a maximal run of rows in which every row has detected == true
+// and consecutive rows are no further apart than gapMS on the AGENT's clock.
+//
+// Two deliberate choices:
+//
+//   - The agent's timestamp (GStreamer PTS, ms) decides the gap, not the
+//     server's received_at. received_at moves with network hiccups, so a
+//     retried POST would look like the hand left and came back - an artefact
+//     invented by the analysis, which is the one thing it must not do.
+//   - A row with detected == false ends the run. That is the signature of a
+//     hand LEAVING the frame, and it is why the recorder keeps those rows by
+//     default even though only detected rows form sessions: they are what
+//     tells two separate holds of the same pose apart.
+//
+// A backwards jump larger than gapMS also breaks the run: the agent's frame
+// counter and PTS restart when the process restarts, and a restart is not a
+// session.
+func splitHandSessions(rows []handLogMeta, gapMS int) []handSessionRun {
+	gap := int64(effectiveGap(gapMS))
+	var (
+		runs []handSessionRun
+		cur  *handSessionRun
+	)
+	flush := func() {
+		if cur != nil {
+			cur.session.Index = len(runs) + 1
+			runs = append(runs, *cur)
+			cur = nil
+		}
+	}
+	for _, m := range rows {
+		if !m.detected {
+			flush()
+			continue
+		}
+		if cur != nil {
+			if d := m.timestamp - cur.session.EndTimestamp; d > gap || d < -gap {
+				flush()
+			}
+		}
+		if cur == nil {
+			cur = &handSessionRun{
+				firstID: m.id,
+				session: HandSession{Gestures: map[string]int{}},
+			}
+			cur.session.StartFrameID = m.frameID
+			cur.session.StartTimestamp = m.timestamp
+		}
+		cur.lastID = m.id
+		cur.session.EndFrameID = m.frameID
+		cur.session.EndTimestamp = m.timestamp
+		cur.session.FrameCount++
+		cur.session.DetectedCount++
+		if m.gesture != "" {
+			cur.session.Gestures[m.gesture]++
+		}
+	}
+	flush()
+	return runs
 }
