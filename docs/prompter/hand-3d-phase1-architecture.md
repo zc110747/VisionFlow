@@ -518,9 +518,9 @@ go test ./...                → 61 PASS / 0 FAIL   （P2 新增 19 个用例）
 |---|---|
 | `POST /api/cameras/camera01/aimode {"mode":"ai-hand"}` | **HTTP 200**（改动前 **400**） |
 | agent 侧 | `[AI] model switched -> mode=hand`；此后稳定 `mode=hand fps=8.0 infer=12.2~14.4ms`，`sent=1420 failed=0 dropped=0 reconnect=0` |
-| `ai_hand_log` | **387 行**，`frame_id 176..6369` 区间内的 4922..6369，`detected=0` ×387（镜头前当前无人举手） |
+| `ai_hand_log` | **387 行**（快照），`frame_id` 4922..6369，`detected=0` ×387（镜头前当时无人举手） |
 | `ai_frame.hand` | `ai_mode='ai-hand'`，hand 块 327 B |
-| `GET /hand/sessions` | `total_rows=176→387`、`gap_ms=1000`、0 会话 —— 与"全部 detected=false"一致 |
+| `GET /hand/sessions` | `total_rows` 与行数一致、`gap_ms=1000`、**0 会话** —— 与"全部 detected=false"自洽 |
 
 schema（在老库上确认，`addColumnIfMissing` 生效）：
 
@@ -587,13 +587,41 @@ ai_hand_log  id, camera_id, frame_id, timestamp,
 `if (AI_MODES.includes(r.mode))` —— 未知模式被**忽略**而非抛错。所以服务端先放行
 `ai-hand` 不会让现有页面坏掉；"手势"按钮与骨架 overlay 留到 P3。
 
-### 13.7 仍未验证 / 待补
+### 13.7 受控链路验证：合成帧走通"部署中的那个 build"
 
-- **真机 `detected=true` 帧的会话与导出实证**（需举手配合）：要验的是 21 点
-  `landmarks` 数组原样过库、按 `gap_ms` 切出来的会话能在导出文件里带全 payload。
-  单测已覆盖（`TestHandSessionsSplitAndExport` 走的是真实 ingest 路由），但**真实 agent
-  产出的大数组**还没进过库。
+单测走的是进程内的 `httptest`；这一轮改成对**正在跑的 :8081** 发真实 HTTP，
+把 HTTP → 解码 → 校验 → 落库 → 切分 → 导出的整条链在部署形态上跑一遍。
+先把 agent 切到 `ai-off`（否则它会往同一 camera_id 插帧，见 §13.8）：
+
+| 步骤 | 结果 |
+|---|---|
+| `POST /api/metadata` × 5（3 帧 FIST → 1 帧 `detected=false` → 1 帧 OPEN_PALM） | 全部 `204` |
+| `GET /hand/sessions` | `total_rows=5`、2 个会话：**#1 = 10001..10003（3 帧 FIST）**、**#2 = 10005（1 帧 OPEN_PALM）** |
+| 同上 `?gap_ms=10000` | 仍 **2** 个会话 —— 印证 §13.4：gap 跨不过 `detected=false` 那一刀 |
+| `GET /hand/sessions/1` | `version=1`、`frames=3`、`gesture=[FIST,FIST,FIST]` |
+| 21 点 landmark 往返 | `landmarks=21`，**逐位一致 = True**（`[100.0,200.0,0.0]` … `[120.0,220.0,0.2]`） |
+| `DELETE /hand/log` | `{"cleared":5}` |
+
+### 13.8 一个测试方法学的坑：灌合成帧前先关 agent
+
+**往 `POST /api/metadata` 灌合成帧时，必须先把 agent 切到 `ai-off`**（或换一个
+`camera_id`）。理由：日志按**插入顺序**（`ORDER BY id`）排列，而真机帧的 PTS 与
+合成帧不是同一时间基 —— 两者会互相插队，触发 §13.4 里"时间戳倒退 = agent 重启"那条规则。
+
+我第一轮就撞上了：真机帧（`ts=494697`）夹在合成帧（`ts=500125` / `500250`）之间，
+`d = -5428ms`，`|d| > gap` ⇒ flush。**本该 1 个会话被切成 3 个**。
+
+这不是 bug（规则按设计生效，且它正是为了防"agent 重启被当成同一段动作"），
+但不设防的验证脚本会因此得出**错误结论**并去改没坏的东西。
+P4 的 `verify_hand.py` 必须注意：要么先关 agent，要么用独立的 camera_id。
+
+### 13.9 仍未验证 / 待补
+
+- **真机 `detected=true` 帧的会话与导出实证**（需举手配合）：要验的是 **agent 真实产出**的
+  21 点 `landmarks`（含 C++ 的定点格式）过库返回来还是不是原样。
+  §13.7 已用合成帧验过服务端这一侧，单测也覆盖，但**真机那一环还没连上**。
 - `ai_hand_log` 的容量上界只在单测里验过（cap=5 剪到 5 行、最旧先剪）；
   真机默认 cap=100000 到不了，暂无法触发。
+
 
 

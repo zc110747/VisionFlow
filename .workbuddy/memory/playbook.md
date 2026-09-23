@@ -301,3 +301,8 @@ ratio ⇒ **报文本身就够标定，不用改代码不用重编**。脚本
 **⚠️ 联合运行下跑 hand 的硬前提**：`ValidAIMode` 必须收 `ai-hand`。
 否则 agent 的 aimode 轮询器读回 `ai-y`，**1 秒内把 agent 从 hand 拽回 detect** ——
 症状是"agent 日志明明打印了 `mode=hand` 却立刻变成 detect"，很容易误判成 agent 的 bug。
+
+**⚠️ 灌合成帧前先 `POST {"mode":"ai-off"}`**：日志按 `ORDER BY id`（插入顺序）排列，
+真机帧的 PTS 与合成帧不是同一时间基，两者互相插队会触发"时间戳倒退 = agent 重启"
+那条切分规则 —— 本该 1 个会话会被切成 3 个。不是 bug，但不设防的验证脚本会
+据此去改没坏的东西（实测数字见架构文档 §13.8）。
