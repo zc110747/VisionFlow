@@ -36,6 +36,13 @@ double to_ms(std::chrono::steady_clock::time_point a,
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
+// The YOLO model a Detect/Pose request loads. One function so the load path,
+// the switch log and the status heartbeat can never disagree about which file
+// belongs to which mode. (Hand runs two different models - see install_mode.)
+const std::string& yolo_model_for(const AIConfig& cfg, AIMode m) {
+    return (m == AIMode::Pose) ? cfg.model_pose : cfg.model;
+}
+
 } // namespace
 
 AIPipeline::~AIPipeline() {
@@ -65,32 +72,12 @@ bool AIPipeline::init(const AIConfig& cfg, int video_width, int video_height,
         interval_ms_ = (ai_fps > 0) ? (1000 / ai_fps) : 0;
     }
 
-    DetectorConfig dcfg;
-    dcfg.model_path     = cfg.model;
-    dcfg.input_width    = cfg.input_width;
-    dcfg.input_height   = cfg.input_height;
-    dcfg.confidence     = cfg.confidence;
-    dcfg.low_confidence = cfg.low_confidence;
-    dcfg.nms_threshold  = cfg.nms_threshold;
-    dcfg.num_threads    = cfg.num_threads;
-    dcfg.class_id       = 0;  // person
-
-    try {
-        detector_ = create_detector();
-    } catch (const std::exception& e) {
-        CA_LOG_ERROR("[AI] detector factory threw: {}", e.what());
-        return false;
-    }
-    if (!detector_) {
-        CA_LOG_ERROR("[AI] detector factory returned null");
-        return false;
-    }
-    if (!detector_->init(dcfg)) {
-        // spec 19: model load failure must not stop the agent.
-        CA_LOG_ERROR("[AI] model init failed ({}), video stream continues without AI",
-                     cfg.model);
-        detector_.reset();
-        return false;
+    // The hand analyzer is pure logic (no model, no ORT), so it is validated up
+    // front: a later switch to Hand then only has to load the two ONNX files.
+    hand_ready_ = hand_analyzer_.init(cfg.hand);
+    if (!hand_ready_) {
+        CA_LOG_WARN("[AI] hand configuration rejected (filter alpha / deadzone "
+                    "out of range); the hand mode stays unavailable");
     }
 
     TrackerConfig tcfg;
@@ -106,29 +93,57 @@ bool AIPipeline::init(const AIConfig& cfg, int video_width, int video_height,
         tracker_ = create_tracker();
     } catch (const std::exception& e) {
         CA_LOG_ERROR("[AI] tracker factory threw: {}", e.what());
-        detector_.reset();
         return false;
     }
     if (!tracker_) {
         CA_LOG_ERROR("[AI] tracker factory returned null");
-        detector_.reset();
         return false;
     }
     tracker_->configure(tcfg);
 
-    const std::string mode =
-        detector_->keypoint_count() > 0
-            ? "pose(" + std::to_string(detector_->keypoint_count()) + "kpt)"
-            : "detect";
+    // ---- initial model ----------------------------------------------------
+    // install_mode() (not apply_mode) because nothing is being "switched" yet;
+    // the ready log below is the event.
+    AIMode start = cfg.initial_mode;
+    if (start == AIMode::Hand && !hand_ready_) start = AIMode::Detect;
+    if (!install_mode(start)) {
+        // A hand model that cannot be loaded must not cost the operator an
+        // otherwise working AI branch (spec 19) - fall back to detection.
+        if (start != AIMode::Detect && install_mode(AIMode::Detect)) {
+            CA_LOG_WARN("[AI] {} models unavailable; started in detect mode instead",
+                        to_string(start));
+        } else {
+            // spec 19: model load failure must not stop the agent.
+            CA_LOG_ERROR("[AI] model init failed ({}), video stream continues without AI",
+                         yolo_model_for(cfg, AIMode::Detect));
+            detector_.reset();
+            return false;
+        }
+    }
+    // Historical auto-detection, preserved: pointing `model` at a pose ONNX used
+    // to move the reported mode to Pose by itself. It stays here - and only here
+    // - because at runtime an explicit request is honoured verbatim (a web click
+    // on "人检测" must not silently answer "pose" and make the overlay drop every
+    // frame as a mode mismatch).
+    if (current_mode_.load() == AIMode::Detect && detector_ &&
+        detector_->keypoint_count() > 0) {
+        current_mode_.store(AIMode::Pose);
+        CA_LOG_INFO("[AI] {} contains a pose head -> mode auto-detected as pose",
+                    cfg.model);
+    }
+
+    const AIMode mode = current_mode_.load();
     CA_LOG_INFO("[AI] ready: backend={} model={} input={}x{} conf={:.2f} mode={}",
-                detector_->backend_name(), cfg.model, cfg.input_width,
-                cfg.input_height, cfg.confidence, mode);
+                active_backend_name(), current_model_path(), cfg.input_width,
+                cfg.input_height, cfg.confidence,
+                (mode == AIMode::Pose || mode == AIMode::Hand)
+                    ? std::string(to_string(mode)) + "(" +
+                          std::to_string(keypoint_count()) + "kpt)"
+                    : std::string(to_string(mode)));
     CA_LOG_INFO("[AI] source {}x{}@{}fps -> {} (queue={}, interval={}ms)",
                 video_width, video_height, video_fps,
                 full_rate ? "full-rate" : "sub-sampled", cfg.queue_size,
                 interval_ms_);
-    current_mode_.store(detector_->keypoint_count() > 0 ? AIMode::Pose
-                                                         : AIMode::Detect);
     return true;
 }
 
@@ -168,11 +183,65 @@ void AIPipeline::request_mode(AIMode m) {
 }
 
 bool AIPipeline::apply_mode(AIMode m) {
-    // Build a fresh detector for the requested model. The ONNX load is slow
-    // (hundreds of ms); it must NOT run under mtx_ so push_frame() stays
-    // non-blocking. The swap back into detector_ is the only locked step.
+    const AIMode before = current_mode_.load();
+    if (!install_mode(m)) return false;
+    const AIMode now = current_mode_.load();
+    if (now == before) {
+        CA_LOG_INFO("[AI] mode={} re-selected; model reloaded ({})", to_string(m),
+                    current_model_path());
+    } else {
+        CA_LOG_INFO("[AI] model switched -> mode={} ({})", to_string(now),
+                    current_model_path());
+    }
+    return true;
+}
+
+bool AIPipeline::install_mode(AIMode m) {
+    // The ONNX load is slow (hundreds of ms); it must NOT run under mtx_ so
+    // push_frame() stays non-blocking. The swap back into the members is the
+    // only locked step, and it happens strictly after a successful load - so a
+    // failure here always leaves the previously working model untouched.
+    if (m == AIMode::Hand) {
+        if (!hand_ready_) {
+            CA_LOG_ERROR("[AI] hand mode unavailable: its configuration was "
+                         "rejected at startup");
+            return false;
+        }
+        std::unique_ptr<IHandDetector> hd;
+        try {
+            hd = create_hand_detector();
+        } catch (const std::exception& e) {
+            CA_LOG_ERROR("[AI] hand detector factory threw: {}", e.what());
+            return false;
+        }
+        if (!hd) {
+            CA_LOG_ERROR("[AI] hand detector factory returned null");
+            return false;
+        }
+        if (!hd->init(cfg_.hand)) {
+            CA_LOG_ERROR("[AI] hand model init failed ({} + {}) - keeping {}",
+                         cfg_.hand.model_palm, cfg_.hand.model_landmark,
+                         to_string(current_mode_.load()));
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            hand_detector_ = std::move(hd);
+            // The modes are mutually exclusive, so holding both would only cost
+            // memory (the YOLO session is ~20 MB) for a model that cannot run.
+            detector_.reset();
+            current_mode_.store(AIMode::Hand);
+            // A fresh hand must not inherit the previous one's origin, filter or
+            // gesture latch - the reference point in particular would make the
+            // first delta a large phantom jump.
+            hand_analyzer_.reset();
+        }
+        return true;
+    }
+
+    // ---- Detect / Pose: the existing YOLO path -----------------------------
     DetectorConfig dcfg;
-    dcfg.model_path     = (m == AIMode::Pose) ? cfg_.model_pose : cfg_.model;
+    dcfg.model_path     = yolo_model_for(cfg_, m);
     dcfg.input_width    = cfg_.input_width;
     dcfg.input_height   = cfg_.input_height;
     dcfg.confidence     = cfg_.confidence;
@@ -202,11 +271,29 @@ bool AIPipeline::apply_mode(AIMode m) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         detector_ = std::move(det);
+        hand_detector_.reset();
         current_mode_.store(m);
     }
-    CA_LOG_INFO("[AI] model switched -> mode={} ({})", to_string(m),
-                (m == AIMode::Pose) ? cfg_.model_pose : cfg_.model);
     return true;
+}
+
+std::string AIPipeline::current_model_path() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    switch (current_mode_.load()) {
+        // First stage of the cascade - the one that names the mode. The
+        // landmark model path is in cfg_.hand.model_landmark and is logged by
+        // the detector itself at init.
+        case AIMode::Hand: return cfg_.hand.model_palm;
+        case AIMode::Pose: return cfg_.model_pose;
+        default:           return cfg_.model;
+    }
+}
+
+const char* AIPipeline::active_backend_name() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (hand_detector_) return hand_detector_->backend_name();
+    if (detector_)      return detector_->backend_name();
+    return "none";
 }
 
 void AIPipeline::push_frame(AIFrame&& f) {
@@ -296,6 +383,15 @@ void AIPipeline::thread_loop() {
 }
 
 void AIPipeline::process(AIFrame& f) {
+    // Hand produces a different shape of result (one cascade, one HandState, no
+    // tracker), so it gets its own frame handler rather than a branch wedged
+    // into the detect/pose path below. current_mode_ is written only by this
+    // thread (install_mode), so this read needs no lock.
+    if (current_mode_.load() == AIMode::Hand) {
+        process_hand(f);
+        return;
+    }
+
     // detector_ may be swapped by apply_mode() (AI thread) between calls; read
     // the pointer once under lock so a whole frame uses one consistent model.
     IDetector* det = nullptr;
@@ -394,6 +490,115 @@ void AIPipeline::process(AIFrame& f) {
         }
         CA_LOG_INFO("[AI] frame={} ts={} objects={} {}", f.frame_id, f.timestamp,
                     res.objects.size(), ss.str());
+    }
+
+    if (result_cb_) {
+        try {
+            result_cb_(res);
+        } catch (const std::exception& e) {
+            CA_LOG_ERROR("[AI] result callback threw: {}", e.what());
+        } catch (...) {
+            CA_LOG_ERROR("[AI] result callback threw an unknown exception");
+        }
+    }
+}
+
+void AIPipeline::process_hand(AIFrame& f) {
+    IHandDetector* det = nullptr;
+    double ai_fps = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        det    = hand_detector_.get();
+        ai_fps = last_fps_;
+    }
+    if (!det) return;
+
+    const auto t0 = std::chrono::steady_clock::now();
+
+    HandDetection hd;
+    bool ok = false;
+    try {
+        ok = det->detect_hand(f.rgb.empty() ? nullptr : f.rgb.data(), f.width,
+                              f.height, hd);
+    } catch (const std::exception& e) {
+        CA_LOG_ERROR("[AI] detect_hand() threw: {}", e.what());
+        ok = false;
+    } catch (...) {
+        CA_LOG_ERROR("[AI] detect_hand() threw an unknown exception");
+        ok = false;
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+
+    if (!ok) {
+        // Same contract as the detect/pose path: a broken detector is logged
+        // and the frame is dropped, but the thread and the video branch live on.
+        ++consecutive_failures_;
+        if (consecutive_failures_ == 1 || consecutive_failures_ == kFailureEscalate) {
+            CA_LOG_ERROR("[AI] hand inference failed ({} consecutive), frame skipped",
+                         consecutive_failures_.load());
+        }
+        return;
+    }
+    consecutive_failures_ = 0;
+
+    // The analyzer is fed even when nothing was found: that is precisely how a
+    // hand that left the frame ages out (lost_frames_to_reset) instead of
+    // freezing its last state forever. It also applies hand.emit_landmarks
+    // itself, so both the object and the hand block see the same decision.
+    HandState hs;
+    hand_analyzer_.update(hd, f.width, f.height, f.frame_id, f.timestamp,
+                          ai_fps, hs);
+
+    const auto t2 = std::chrono::steady_clock::now();
+
+    AIFrameResult res;
+    res.frame_id     = f.frame_id;
+    res.timestamp    = f.timestamp;
+    res.video_width  = video_w_;
+    res.video_height = video_h_;
+    res.ai_mode      = aimode_web_string(AIMode::Hand);
+    if (hs.detected) {
+        // Reuse the existing object shape so the overlay's generic "draw boxes
+        // and keypoints" path works unchanged (spec 10). track_id stays -1:
+        // Phase 1 is single-hand and nothing downstream consumes a hand id.
+        AIObject o;
+        o.class_name = "hand";
+        o.class_id   = -1;   // not a COCO class
+        o.confidence = hs.confidence;
+        o.track_id   = -1;
+        o.x1 = hs.x1;
+        o.y1 = hs.y1;
+        o.x2 = hs.x2;
+        o.y2 = hs.y2;
+        o.keypoints = hs.landmarks;   // already empty when landmarks are off
+        res.objects.push_back(std::move(o));
+    }
+    // Engaged even with no hand: the frame is a hand-mode frame, and the extra
+    // fields (reference state, gesture latch) are exactly what the debug panel
+    // needs in order to explain an empty frame.
+    res.hand = std::move(hs);
+
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        ++processed_;
+        objects_       = res.objects.size();
+        sum_infer_ms_ += to_ms(t0, t1);
+        sum_track_ms_ += to_ms(t1, t2);   // hand: analyzer time, not a tracker
+        ++stat_frames_;
+        log_periodic_locked();
+    }
+
+    const HandState& h = *res.hand;
+    // Same gate as the detect/pose path: log the frame only when the model
+    // actually found something, otherwise a 12 fps empty scene floods the log.
+    if (cfg_.log_objects && h.detected) {
+        CA_LOG_INFO("[AI] frame={} ts={} mode=hand conf={:.2f} "
+                    "hand={} gesture={} motion=({},{},{})",
+                    f.frame_id, f.timestamp, h.confidence,
+                    to_string(h.handedness), to_string(h.gesture),
+                    to_string(h.motion.x), to_string(h.motion.y),
+                    to_string(h.motion.z));
     }
 
     if (result_cb_) {

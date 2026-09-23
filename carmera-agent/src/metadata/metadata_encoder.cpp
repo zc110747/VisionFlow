@@ -48,6 +48,16 @@ std::string fixed2(double v) {
     return os.str();
 }
 
+// Normalised logical coordinates are O(1) numbers where the deadzone that
+// separates "moving" from "STATIONARY" is 0.02 - two decimals would leave only
+// two representable values inside that band, so the debug panel could not show
+// whether a hand is jittering. Four decimals is ~0.13 px at 1280 wide.
+std::string fixed4(double v) {
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(4) << v;
+    return os.str();
+}
+
 // std::min/std::max based clamp that tolerates lo > hi (std::clamp would be UB).
 int clampi(int v, int lo, int hi) {
     if (hi < lo) hi = lo;
@@ -103,6 +113,62 @@ uint64_t epoch_ms() {
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
+// --- hand extension (Phase 1) ----------------------------------------------
+// Additive: the "hand" key is present ONLY on frames the hand mode produced, so
+// a detect / pose frame is byte-identical to what earlier agent builds sent.
+// (metadata_tests.cpp pins that, it is the whole reason the field is optional
+// on AIFrameResult rather than a default-constructed struct.)
+
+std::string vec3_json(const Vec3& v) {
+    std::ostringstream os;
+    os << '[' << fixed4(v.x) << ',' << fixed4(v.y) << ',' << fixed4(v.z) << ']';
+    return os.str();
+}
+
+// 21 x [x, y, z] in ORIGINAL video pixels. z shares x/y's scale - it is the
+// landmark model's wrist-relative depth, NOT centimetres (see
+// carmera-agent/models/README.md). The shared per-object "keypoints" field
+// stays a 2D [x,y,conf] triple: its arity is part of the pose contract, and a
+// third dimension is a hand-only concept, so it lives in this block instead.
+std::string hand_landmarks_json(const std::vector<Keypoint>& kpts) {
+    std::ostringstream os;
+    os << ",\"landmarks\":[";
+    for (size_t i = 0; i < kpts.size(); ++i) {
+        const Keypoint& k = kpts[i];
+        if (i) os << ',';
+        os << '[' << fixed2(k.x) << ',' << fixed2(k.y) << ',' << fixed2(k.z) << ']';
+    }
+    os << ']';
+    return os.str();
+}
+
+std::string hand_json(const HandState& h) {
+    std::ostringstream os;
+    os << ",\"hand\":{"
+       << "\"detected\":" << (h.detected ? "true" : "false")
+       << ",\"confidence\":" << fixed2(h.confidence)
+       << ",\"handedness\":" << jstr(to_string(h.handedness))
+       // False until the hand has been stable for reference_stable_frames. It
+       // is on the wire because a consumer MUST NOT act on delta before it is
+       // true - that is what stops the phantom jump when a hand enters frame.
+       << ",\"reference_initialized\":"
+       << (h.reference_initialized ? "true" : "false")
+       << ",\"position\":" << vec3_json(h.position)
+       << ",\"reference\":" << vec3_json(h.reference)
+       << ",\"delta\":" << vec3_json(h.delta)
+       << ",\"motion\":{\"x\":" << jstr(to_string(h.motion.x))
+       << ",\"y\":" << jstr(to_string(h.motion.y))
+       << ",\"z\":" << jstr(to_string(h.motion.z)) << "}"
+       << ",\"gesture\":" << jstr(to_string(h.gesture))
+       // The pre-debounce value of this frame: the debug panel shows both so a
+       // gesture that flaps between two poses is visible as such.
+       << ",\"gesture_candidate\":" << jstr(to_string(h.gesture_candidate))
+       << ",\"gesture_confidence\":" << fixed2(h.gesture_confidence);
+    if (!h.landmarks.empty()) os << hand_landmarks_json(h.landmarks);
+    os << '}';
+    return os.str();
+}
+
 } // namespace
 
 std::string encode_frame_metadata(const AIFrameResult& r, const MetadataConfig& cfg) {
@@ -135,7 +201,11 @@ std::string encode_frame_metadata(const AIFrameResult& r, const MetadataConfig& 
         s += keypoints_json(o, r.video_width, r.video_height);
         s += '}';
     }
-    s += "]}";
+    s += ']';
+    // Hand mode only. Emitted after "objects" so the detect/pose prefix of the
+    // payload is not shifted by a single byte.
+    if (r.hand) s += hand_json(*r.hand);
+    s += '}';
     return s;
 }
 

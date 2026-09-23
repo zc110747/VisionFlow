@@ -165,6 +165,65 @@ bool load_config(Config& cfg, const std::string& path) {
         cfg.ai.aimode_poll     = as_bool(find(*n, "aimode_poll"), cfg.ai.aimode_poll);
         cfg.ai.aimode_poll_ms  = as_int(find(*n, "aimode_poll_ms"), cfg.ai.aimode_poll_ms);
         cfg.ai.aimode_base_url = as_str(find(*n, "aimode_base_url"), cfg.ai.aimode_base_url);
+
+        // Mode the branch starts in. An unrecognised token keeps the default
+        // instead of aborting the load - a typo in a config file must not cost
+        // the operator the whole run.
+        const std::string im = as_str(find(*n, "initial_mode"), "");
+        if (!im.empty()) {
+            AIMode parsed;
+            if (aimode_from_string(im, parsed)) {
+                cfg.ai.initial_mode = parsed;
+            } else {
+                CA_LOG_WARN("[config] ai.initial_mode '{}' is not a known mode "
+                            "(detect|pose|hand); keeping '{}'",
+                            im, to_string(cfg.ai.initial_mode));
+            }
+        }
+
+        // ---- hand mode (Phase 1) ------------------------------------------
+        if (auto* h = find(*n, "hand")) {
+            cfg.ai.hand.model_palm    = as_str(find(*h, "model_palm"), cfg.ai.hand.model_palm);
+            cfg.ai.hand.model_landmark =
+                as_str(find(*h, "model_landmark"), cfg.ai.hand.model_landmark);
+            cfg.ai.hand.palm_score_threshold =
+                as_float(find(*h, "palm_score_threshold"), cfg.ai.hand.palm_score_threshold);
+            cfg.ai.hand.palm_nms_threshold =
+                as_float(find(*h, "palm_nms_threshold"), cfg.ai.hand.palm_nms_threshold);
+            cfg.ai.hand.landmark_confidence =
+                as_float(find(*h, "landmark_confidence"), cfg.ai.hand.landmark_confidence);
+            cfg.ai.hand.max_hands  = as_int(find(*h, "max_hands"), cfg.ai.hand.max_hands);
+            cfg.ai.hand.filter_alpha =
+                as_float(find(*h, "filter_alpha"), cfg.ai.hand.filter_alpha);
+            cfg.ai.hand.motion_deadzone =
+                as_float(find(*h, "motion_deadzone"), cfg.ai.hand.motion_deadzone);
+            cfg.ai.hand.reference_stable_frames =
+                as_int(find(*h, "reference_stable_frames"),
+                       cfg.ai.hand.reference_stable_frames);
+            cfg.ai.hand.lost_frames_to_reset =
+                as_int(find(*h, "lost_frames_to_reset"), cfg.ai.hand.lost_frames_to_reset);
+            cfg.ai.hand.gesture_confirm_frames =
+                as_int(find(*h, "gesture_confirm_frames"),
+                       cfg.ai.hand.gesture_confirm_frames);
+            cfg.ai.hand.depth_source =
+                as_str(find(*h, "depth_source"), cfg.ai.hand.depth_source);
+            cfg.ai.hand.invert_x = as_bool(find(*h, "invert_x"), cfg.ai.hand.invert_x);
+            cfg.ai.hand.invert_y = as_bool(find(*h, "invert_y"), cfg.ai.hand.invert_y);
+            cfg.ai.hand.invert_z = as_bool(find(*h, "invert_z"), cfg.ai.hand.invert_z);
+            cfg.ai.hand.emit_landmarks =
+                as_bool(find(*h, "emit_landmarks"), cfg.ai.hand.emit_landmarks);
+
+            // depth_source is a closed vocabulary, not free text: an unknown
+            // value would silently fall through the mapper's default branch and
+            // make the §16 experiment report the wrong axis.
+            if (cfg.ai.hand.depth_source != "size" &&
+                cfg.ai.hand.depth_source != "landmark_z") {
+                CA_LOG_WARN("[config] ai.hand.depth_source '{}' is not a known "
+                            "source (size|landmark_z); using 'size'",
+                            cfg.ai.hand.depth_source);
+                cfg.ai.hand.depth_source = "size";
+            }
+        }
     }
     // ---- Metadata upload (Phase 2 / spec 9): server address is never hard-coded
     if (auto* n = find(root, "metadata")) {

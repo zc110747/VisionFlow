@@ -15,7 +15,7 @@ Windows PC
   -> ffplay / 任意 RTSP 客户端
 ```
 
-本项目只负责：**摄像头采集 · 视频编码 · RTSP 推流 · 设备状态 · 自动重连 · 配置管理 · 端侧 AI 推理（人检测 + 跟踪，可选） · AI 结果上报（Metadata，可选）**。
+本项目只负责：**摄像头采集 · 视频编码 · RTSP 推流 · 设备状态 · 自动重连 · 配置管理 · 端侧 AI 推理（人检测 + 跟踪 / 人体姿态 / 手部 3D 关键点，可选） · AI 结果上报（Metadata，可选）**。
 **不**实现 RTSP Server / Web Server / Web UI / WebRTC / 数据库 / 用户管理 / 视频转发。
 
 ---
@@ -52,22 +52,27 @@ camera-agent/
 ├── start-camera-agent.bat    # 一键启动 demo：MediaMTX -> agent -> ffplay
 ├── mediamtx.yml              # MediaMTX 演示配置（强制 TCP、禁录制）
 ├── config/camera-agent.yaml  # YAML 配置（可选，CLI 优先）
+├── models/                   # ONNX 模型：yolo11n / yolo11n-pose / MediaPipe 手部两级级联
+│                             #   溯源、I/O 形状与 SHA-256 见 models/README.md
 ├── include/camera_agent/     # 公共头：types / config / camera_manager /
 │                             #   video_pipeline / rtsp_publisher / stream_controller / backoff / logger
 │                             #   ai/{ai_types,detector,tracker,ai_pipeline}.h
+│                             #   ai/{hand_types,hand_decode,hand_detector,hand_analyzer}.h
 ├── src/
 │   ├── main.cpp              # CLI 解析 + 运行循环 + SIGINT 优雅退出
 │   ├── camera/               # camera_manager_sim.cpp / camera_manager_gst.cpp
 │   ├── pipeline/             # video_pipeline_sim.cpp / video_pipeline_gst.cpp
 │   ├── rtsp/                 # rtsp_publisher_sim.cpp / rtsp_publisher_gst.cpp
 │   ├── ai/                   # yolo_detector.cpp (ORT) / byte_tracker.cpp / ai_pipeline.cpp
+│   │                         #   hand_decode.cpp / hand_detector.cpp / hand_analyzer.cpp
 │   ├── metadata/             # metadata_encoder.cpp / metadata_manager.cpp
 │   │                         #   / http_transport_winhttp.cpp (WinHTTP，无额外依赖)
 │   ├── config/config.cpp     # 极简 YAML 解析（无额外依赖）
 │   └── common/stream_controller.cpp  # 编排 + 自动重连
 ├── third_party/
 │   └── stb_image.h           # 单元测试用的单头 JPEG/PNG 解码（仅 tests 链接）
-├── tests/                    # 轻量测试框架 + 22 个用例（强制 SIM 后端，可无头运行）
+├── tests/                    # 轻量测试框架 + 55 个用例（强制 SIM 后端，可无头运行）
+│   ├── golden/               # 手部黄金夹具 + 全量 anchor 参考表 + 生成脚本（见 golden/README.md）
 │   └── finished/             # 运行/验证产物（日志、抓帧）落此处，已 gitignore
 └── scripts/
     ├── build-msvc.ps1        # MSVC + Ninja 构建（推荐，原生 PowerShell）
@@ -88,6 +93,7 @@ camera-agent/
 - 依赖仅 `spdlog`（CMake `FetchContent` 自动拉取），无其他第三方依赖。
 - **可选**——**ONNX Runtime 1.x（Windows x64 CPU）**：AI 分支加载 `.onnx` 模型用。未安装时 AI 自动停用，编出 `NullDetector`，视频链路不受影响。`include\` + `lib\` 即可；运行时 DLL 由 CMake `POST_BUILD` 自动拷到 exe 旁。CMake 按 `-DONNXRUNTIME_ROOT` → `$ENV{ONNXRUNTIME_ROOT}` → `D:/Software/onnxruntime` → `C:/onnxruntime` → 其他通用前缀顺序定位。
 - **可选**——YOLO11 模型（Ultralytics 官方 ONNX，下载地址与 SHA-256 见 `third_lib.md`）：`yolo11n.onnx`（检测，默认）与 `yolo11n-pose.onnx`（17 关键点姿态），放在项目根 `models/` 下；路径可在 `ai.model` 配置或 `--ai-model` 覆盖，检测/姿态模型自动识别。
+- **可选**——MediaPipe 手部模型（Apache-2.0，**已入库**，见 `models/README.md`）：`palm_detection_mediapipe_2023feb.onnx`（掌心检测）+ `handpose_estimation_mediapipe_2023feb.onnx`（21 点），仅在 `--ai-mode hand` 时加载。
 
 > 外部工具一律按**裸名称**调用，因此必须在本机 `PATH` 上。双击 `.bat` 时继承的是注册表里的系统/用户 PATH，**不是**已开终端的 PATH —— 改完 PATH 要重开终端才生效。
 
@@ -180,15 +186,40 @@ ai:
   num_threads: 2               # ONNX Runtime intra-op 线程
 
 # ---- 运行时 AI 模式切换（Web → video-server → agent 轮询）----
+# 启动模式：detect | pose | hand（也可写 ai-y / ai-y-pose / ai-hand）。
+# 仅决定第一个请求到达前跑什么，以及「没有服务端时怎么单独跑某模式」。
+  initial_mode: detect
 # model_pose：姿态模型路径；Web 选 ai-y-pose 时运行时换此模型，无需重启。
   model_pose: models/yolo11n-pose.onnx
   # agent 主动轮询 video-server 的 GET /api/cameras/{id}/aimode 拿期望模式：
   #   ai-off    -> 保持当前模型，仅 Web 隐藏 overlay（不通知 agent 停模型）
   #   ai-y      -> 换 yolo11n（人检测）
   #   ai-y-pose -> 换 yolo11n-pose（17 关键点姿态）
+  #   ai-hand   -> 换掌心+21 点两级级联（手部 3D）
   aimode_poll: true                            # false = 固定启动模型，不接受 Web 切换
   aimode_poll_ms: 2000                         # 轮询周期
   aimode_base_url: ""                          # 留空=自动从 metadata.server_url 派生（建议，单端点配置）。显式填 http://127.0.0.1:8080 也行
+
+# ---- 手部模式（Phase 1：单只手的 21 点 3D 关键点 + 运动 + 手势）----
+# 同一条 AIPipeline、同一个 metadata 端点：选 hand 只是换掉加载的模型。
+# 完整注释见 config/camera-agent.yaml；这里只列结构与默认值。
+  hand:
+    model_palm: models/palm_detection_mediapipe_2023feb.onnx
+    model_landmark: models/handpose_estimation_mediapipe_2023feb.onnx
+    palm_score_threshold: 0.5    # 掌心检测门限
+    palm_nms_threshold: 0.3      # 掌心 NMS IoU
+    landmark_confidence: 0.5     # 关键点模型门限
+    max_hands: 1                 # Phase 1 单只手：取最高分掌心
+    filter_alpha: 0.4            # EMA
+    motion_deadzone: 0.02        # |delta| 低于此值判 STATIONARY
+    reference_stable_frames: 3   # 参考点锁存前需连续检出的帧数
+    lost_frames_to_reset: 10     # 丢失多少帧后状态机复位
+    gesture_confirm_frames: 5    # 手势需连续保持多少帧才确认
+    depth_source: size           # size | landmark_z（决定 logical Y=FORWARD 的来源）
+    invert_x: false              # 相机装反时翻某个 logical 轴
+    invert_y: false
+    invert_z: false
+    emit_landmarks: true        # false 则 metadata 不带 21 点，报文显著变小
 
 # ---- Metadata 分支（Phase 2：AI 结果异步上报；失败绝不影响视频/AI）----
 metadata:
@@ -246,6 +277,12 @@ MediaMTX 从项目根目录启动时会自动加载本文件。`all_others` + �
 | `--ai-confidence <f>` | 0.5 | 检测+跟踪置信度门限 |
 | `--ai-model <path>` | `models/yolo11n.onnx` | ONNX 模型路径（检测/姿态自动识别） |
 | `--ai-model-pose <path>` | `models/yolo11n-pose.onnx` | 姿态模型路径（Web 切 ai-y-pose 时运行时换） |
+| `--ai-mode <mode>` | detect | 启动模式：detect \| pose \| hand（也接受 ai-y / ai-y-pose / ai-hand）；不需要服务端即可单跑某模式 |
+| `--ai-hand-palm <path>` | `models/palm_detection_mediapipe_2023feb.onnx` | 手部掌心检测模型 |
+| `--ai-hand-landmark <path>` | `models/handpose_estimation_mediapipe_2023feb.onnx` | 手部 21 点模型 |
+| `--ai-hand-depth <src>` | size | 手部深度轴来源：size \| landmark_z |
+| `--ai-hand-invert-x/-y/-z` | - | 翻转手部 logical 轴（相机装反时用） |
+| `--no-ai-hand-landmarks` | - | 上报不带 21 点，报文显著变小 |
 | `--ai-aimode-base <url>` | `http://127.0.0.1:8081` | 轮询 video-server 的基址（取 `/api/cameras/{id}/aimode`） |
 | `--ai-aimode-poll-ms <ms>` | 2000 | AI 模式轮询周期 |
 | `--no-ai-aimode` | - | 关闭 Web 驱动切换（固定启动模型，不接受 ai-y/ai-y-pose 切换） |
@@ -287,7 +324,18 @@ camera-agent --ai --width 1280 --height 720 --fps 30 --duration 30
 python scripts/metadata-mock-server.py --port 8000
 camera-agent --ai --metadata --metadata-url http://127.0.0.1:8000/api/metadata \
              --metadata-camera-id camera01 --metadata-heartbeat 10 --duration 30
+
+# 手部 3D 模式（不需要服务端也能起：启动模式由 CLI 决定）
+camera-agent --ai --metadata --metadata-url http://127.0.0.1:8000/api/metadata \
+             --ai-mode hand --duration 30
+
+# 手部方向实验：切换深度来源 / 翻转某个 logical 轴（结果记入文档，不要靠猜）
+camera-agent --ai --ai-mode hand --ai-hand-depth landmark_z --duration 15
+camera-agent --ai --ai-mode hand --ai-hand-invert-x --duration 15
 ```
+
+> 手部模式启动时会加载两个 ONNX（实测约 100–200ms）。模型缺失或加载失败**不会**让 agent 退出：
+> 会记一条 ERROR/WARN 并回落到人检测（`--ai-mode` 指定的模式被拒时同理，切换失败则保持原模型不变）。
 
 ### 一键启动（demo：MediaMTX + agent + ffplay）
 
@@ -311,21 +359,93 @@ start-camera-agent.bat --camera 1 --no-auto --width 640 --height 480 --fps 30
 
 > 为什么必须"先等流就绪再开 ffplay"：agent 报 `STREAMING` 比 mediamtx 真正注册路径早约 1 秒，此时 ffplay 发 DESCRIBE 会拿到 `404 Not Found` 并立即退出。
 
-### Web 驱动 AI 模式切换（三态）
+### Web 驱动 AI 模式切换（四态）
 
 控制链路：**Web UI → POST `/api/cameras/{id}/aimode` → video-server 落库 → agent 轮询 `GET /api/cameras/{id}/aimode` → 运行时换模型**。agent→server 是单向 WinHTTP POST（metadata），无反向通道，故采用 agent 主动轮询。
 
-三种模式（默认 `ai-y`）：
+四种模式（默认 `ai-y`）：
 
 | 模式 | 含义 | agent 行为 | Web 行为 |
 |------|------|-----------|----------|
 | `ai-off` | 关 AI 显示 | **不换模型**（保持启动模型），忽略该请求 | 仅隐藏检测框/骨架 overlay |
 | `ai-y` | 人检测 | 运行时换 `yolo11n`（Detect） | 画检测框 |
 | `ai-y-pose` | 姿态检测 | 运行时换 `yolo11n-pose`（Pose，17 关键点） | 画检测框 + COCO 骨架连线 |
+| `ai-hand` | 手部 3D | 运行时换掌心 + 21 点两级级联（Hand） | 画手部骨架 + HUD（手势/运动） |
 
-- 切换在 AI 线程内完成：ONNX 重新加载（慢，~数百 ms）在锁外进行，仅 `detector_` 指针交换这一步加锁，因此**绝不阻塞视频/采集线程**。
-- `ai-off` 不通知 agent 停模型（符合需求：只关界面显示）；`ai-y`/`ai-y-pose` 才会触发模型重建并重绘。
-- 单测 `ai_pipeline_switch_models` 验证 Detect↔Pose 运行时可切换且 `current_mode()`/`keypoint_count()` 同步；video-server 侧 `TestAIMode*`/`TestSaveFrameRoundTripsKeypoints` 覆盖落库、默认、非法拒绝、keypoints 透传。
+- 模式 token 只有**一个解析点**（`aimode_from_string`，CLI / YAML / 轮询器共用）；`ai-off` 与任何无法识别的 token 一律**不解析** —— 前者语义是"Web 停止绘制"，后者是别的构建才支持的模式，都不能被悄悄翻译成一次模型切换。
+- 切换在 AI 线程内完成：ONNX 重新加载（慢，~数百 ms）在锁外进行，仅指针交换这一步加锁，因此**绝不阻塞视频/采集线程**。切换成功后才释放旧模型（Detect/Pose 与 Hand 互斥，两套同时挂着只是白占 ~20MB）。
+- 切模式时 `HandAnalyzer` 被重置：参考点、EMA、手势锁存都不跨模式继承，否则第一次 delta 会是一个巨大的幽灵位移。
+- `ai-off` 不通知 agent 停模型（符合需求：只关界面显示）；其余三种才会触发模型重建并重绘。
+- 心跳里的 `model` 报的是**当前模式实际加载的模型**（hand 模式报掌心模型），不是配置里的 `ai.model` —— 否则 UI 会在 hand 模式下谎报 yolo11n。
+- 单测 `ai_pipeline_switch_models`（Detect↔Pose）与 `ai_pipeline_hand_mode_round_trip`（Detect↔Hand，含 `keypoint_count()` 21↔0）验证运行时可切换；video-server 侧 `TestAIMode*`/`TestSaveFrameRoundTripsKeypoints` 覆盖落库、默认、非法拒绝、keypoints 透传。
+
+---
+
+## 手部 3D 识别（Phase 1：单只手，21 点 + 运动 + 手势）
+
+> **边界**：这一章到"产出结构化 `hand` metadata"为止。**不包含**机器人、IK、舵机、MuJoCo、RobotCommand ——
+> 那些属于另一个项目，`hand_types.h` 里连一个相关概念都不许出现。
+
+### 位置：同一条 AI 链路里的一个新模式
+
+```
+camera ──tee──┬──► video pipeline ─────────► RTSP ─► MediaMTX ─► 浏览器 <video>   （完全不动）
+              │
+              └──► AIPipeline（同一个线程、同一个有界队列、同一个 MetadataManager）
+                        │
+                        ├─ AIMode::Detect → OnnxYoloDetector(yolo11n)
+                        ├─ AIMode::Pose   → OnnxYoloDetector(yolo11n-pose)
+                        └─ AIMode::Hand   → OnnxHandDetector ─► HandAnalyzer ─► HandState
+                                                                                    │
+                                                              AIFrameResult.hand ───┘
+                                                              → 编码为 "hand" 加法字段
+```
+
+不新增服务、不新增第二套视频流、不新增第二套 metadata 协议；`IDetector` 抽象刻意**没有**被改（手部两级级联需要两个模型 + ROI 变换，塞进 `IDetector` 只会污染人检测/姿态两条既有路径），而是并列了一个 `IHandDetector`。
+
+### 两级级联（MediaPipe 方案，Apache-2.0，模型已入库）
+
+```
+frame ──► palm detector (192x192, 2016 anchors) ──► 掌心框 + 7 个掌心关键点
+                                          │
+                                          ├─ 按掌心关键点算旋转角（复刻 _cropAndPadFromPalm）
+                                          └─ 仿射裁切 224x224 ──► landmark model ──► 21 x (x,y,z) + handedness
+```
+
+- 21 点顺序为 MediaPipe 约定（0 手腕、1-4 拇指、5-8 食指、9-12 中指、13-16 无名指、17-20 小指）。
+- **刻意不使用 OpenCV**：双线性重采样、`INTER_AREA`、仿射、letterbox、NMS 全部自实现，和 `yolo_detector.cpp` 保持同一策略，便于后续搬 RK3568。
+- 高风险的解码原语（anchor 生成 / 逐行解码 / 真 IoU NMS）拆在 `hand_decode.h/.cpp`，**无需模型即可单测**。
+
+### 后处理流水（`HandAnalyzer`，纯逻辑，可无模型单测）
+
+```
+HandDetection ─► 坐标映射(spec 17) ─► EMA 滤波 ─► 参考点状态机 ─► 运动判定(死区) ─► 手势 + 去抖 ─► HandState
+```
+
+- **logical 坐标系**（下游只说这一套，模型/相机的原始轴不外泄）：`X+` 右、`Y+` 前（朝相机）、`Z+` 上；位置/参考/位移全部**归一化**（x∈[0,1] 按帧宽，z∈[0,1] 按帧高且 0 在底部，y 是深度代理）。
+- **参考点**：手必须连续稳定检出 `reference_stable_frames` 帧才锁存，且锁的是**滤波后**位置。锁存之前 `delta` 一律置零 —— 否则手刚入画那一帧的抖动会被永久烘焙进之后每一个 delta。
+- **死区**：`|delta_axis| < motion_deadzone` 判 `STATIONARY`，这是唯一能压住"手抖导致 LEFT/RIGHT 反复横跳"的机制。
+- **手势**：四指 `|tip-wrist| / |MCP-wrist|` 的比值投票（拇指不参与，它最噪且两种手势都含）。`OPEN_PALM` 阈值 `1.15` 有真实数据出处：官方样例图上实测张开手为 1.59–1.84。
+- **Z 的语义**（实测钉死，不是假设）：模型输出的 `landmark.z` 是**相对手腕**的深度，手腕 z 恒为 0，与"手离相机多远"无关 —— 它描述**朝向**。因此 logical `Y = FORWARD/BACKWARD` 默认取**手的表观尺寸**（`depth_source: size`），`landmark_z` 保留为可选项供方向实验复现。
+
+### 运行
+
+```bash
+camera-agent --ai --metadata --metadata-url http://127.0.0.1:8081/api/metadata --ai-mode hand
+start.bat --ai-mode hand        # 联合运行（server + agent）直接以手部模式起
+```
+
+### 已知未验证项（显式标注，不含糊）
+
+| 项 | 状态 |
+|---|---|
+| `kCurledRatio = 0.90`（握拳侧阈值） | **未实测**。黄金夹具里没有握拳样本；需真机补一张 fist 图后才能定。`kExtendedRatio` 有实测出处，这个没有 |
+| `depth_source` 的方向（哪个符号是"靠近"） | **待真机实验**（`--ai-hand-depth` 可切换两种来源对比） |
+| 真实 UVC 摄像头的 `invert_*` 取值 | **待真机实验**（`--ai-hand-invert-x/-y/-z`） |
+
+模型溯源、I/O 实测形状与 SHA-256：`models/README.md`。
+黄金夹具、全量 anchor 参考表与生成脚本：`tests/golden/README.md`。
+架构分析与实证记录（含"为什么夹具必须是 PNG"）：`../docs/prompter/hand-3d-phase1-architecture.md`。
 
 ---
 
@@ -339,7 +459,7 @@ ctest --test-dir build-msvc --output-on-failure
 ctest --test-dir build --output-on-failure
 ```
 
-覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、**运行时 AI 模式切换（Detect↔Pose 不重启）**、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）。**27/27 通过**。
+覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、**运行时 AI 模式切换（Detect↔Pose、Detect↔Hand 不重启）**、手部（anchor 全 2016 值核对、黄金图 21 点亚毫像素比对、坐标映射/EMA/reference/deadzone/手势去抖、hand 报文逐字节固定）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）。**55/55 通过**。
 
 ### 2. 端到端验收（`scripts/e2e-test.ps1`，真实 GStreamer 后端）
 
@@ -577,7 +697,7 @@ Camera (mfvideosrc 1280x720@30)
 
 ### 单元测试（无头端到端）
 
-`tests/ai_detector_tests.cpp` 三个用例（已合入 ctest，22/22 总通过）：
+`tests/ai_detector_tests.cpp` 三个用例（已合入 ctest，55/55 总通过）：
 
 - `ai_detector_bus_image`：在 Ultralytics 官方 `bus.jpg` 上跑真模型，断言 ≥1 个 person、bbox 全在 `[0,w]×[0,h]` 内。**实测 4 个 person**。
 - `ai_tracker_stable_ids`：3 帧直线漂移的合成检测 → 1 个稳定 track id。
@@ -651,7 +771,40 @@ AI 线程                        MetadataManager（独立发送线程）
 
 - `keypoints` 为**加法扩展、可选字段**：仅 pose 模型（如 `yolo11n-pose.onnx`）输出，检测模型的消息与旧版逐字节一致。
 - 语义：COCO 17 关键点顺序（0 鼻 … 16 右踝），`[x, y, conf]`，x/y 为**原始视频像素**（已裁剪入帧，2 位小数），conf ∈ [0,1]（模型内已 sigmoid，接收方**不得**再做 sigmoid）。
-- 心跳 `ai` 段带 `"keypoints": 17` 表示当前为姿态模式（检测模型无此字段）。
+- 心跳 `ai` 段带 `"keypoints": 17` 表示当前为姿态模式（检测模型无此字段）；`21` 表示手部模式。
+
+**手部模式**（`--ai-mode hand`）在 `objects` 之后**追加**一个 `hand` 块，帧消息的其余部分与上表完全相同：
+
+```json
+{
+  "version": 1, "type": "frame", "camera_id": "camera01",
+  "frame_id": 15230, "timestamp": 1756773210123,
+  "video_width": 1280, "video_height": 720, "ai_mode": "ai-hand",
+  "objects": [
+    { "class": "hand", "confidence": 0.99, "track_id": -1, "bbox": [100, 200, 400, 600],
+      "keypoints": [[338, 677, 0.99], ["…共 21 项…", 0.98]] }
+  ],
+  "hand": {
+    "detected": true, "confidence": 0.99, "handedness": "right",
+    "reference_initialized": true,
+    "position": [0.5120, 0.7340, 0.4800],
+    "reference": [0.5000, 0.7000, 0.5000],
+    "delta": [0.0120, 0.0340, -0.0200],
+    "motion": { "x": "RIGHT", "y": "FORWARD", "z": "STATIONARY" },
+    "gesture": "OPEN_PALM", "gesture_candidate": "FIST", "gesture_confidence": 1.00,
+    "landmarks": [[338.13, 676.54, -0.00], ["…共 21 项…"]]
+  }
+}
+```
+
+- 手部对象沿用**现有 object 结构**（`objects[]` 里一条 `class:"hand"`），所以前端"画框 + 连关键点"的通用路径不用改；`track_id` 恒为 `-1`（Phase 1 单只手，不跟踪，不编造 ID）。
+- `position / reference / delta` 是 **logical 坐标系下的归一化值**（`X+` 右 / `Y+` 前 / `Z+` 上），4 位小数；不是像素，也不是厘米。
+- `reference_initialized` 为 `false` 时 **`delta` 无意义、消费方不得使用** —— 这是防止手刚入画时产生一次巨大的幽灵位移。
+- `motion` 三轴取值：`STATIONARY` / `LEFT` / `RIGHT` / `FORWARD` / `BACKWARD` / `UP` / `DOWN`；`gesture` 取值：`UNKNOWN` / `OPEN_PALM` / `FIST`。`gesture_candidate` 是**去抖之前**的本帧判定，调试面板用它解释"手势在两种姿态间抖动"。
+- `landmarks` 是 21 × `[x, y, z]`，**原始视频像素**；`z` 与 x/y 同尺度，是**相对手腕**的深度（描述手指朝向，**不是离相机多远**，更不是厘米）—— 依据见 `models/README.md`。
+- 注意 `objects[].keypoints` 的 x/y 走通用编码会被 `lround` 取整（它是给 canvas 画的），要亚像素/带 z 的数就取 `hand.landmarks`。
+- **检测/姿态帧不含任何 hand 字段**（`AIFrameResult::hand` 是 optional，只有 hand 模式才 engage），单测 `hand_absent_on_detect_frame` / `hand_absent_on_pose_frame` 用**逐字节固定字符串**钉住这一点。
+- `hand.emit_landmarks: false` 会同时去掉对象的关键点和 `hand.landmarks`，报文显著变小（只留框与派生状态）。
 
 心跳/状态消息（`heartbeat_interval_sec` 周期，默认 10s）：
 
@@ -741,7 +894,7 @@ std::unique_ptr<IMetadataTransport> create_metadata_transport(const MetadataConf
 | 5 | **AI 异常** | 模型路径故意填错 `models/does-not-exist.onnx` + `--ai --metadata`（`--source videotestsrc`） | 日志 `[AI] model file not found` → `[AI] model init failed (...), video stream continues without AI` → `[warning] [AI] not started; video stream is unaffected`；视频全程 `STREAMING`（frames=424 `dropped=0` bitrate≈4070kbps），AI 不产出结果 → metadata 只剩心跳（`sent=3`，无 `frame` 消息）；mock 收到 cam_t5 共 3 条；agent 正常退出（exit=0） |
 | 6 | **AI 关闭** | `--no-ai --metadata`（`--source videotestsrc`） | 视频正常 `STREAMING`（frames=426 `dropped=0` bitrate≈3897kbps）；管线不含 tee/aisplit（AI 分支完全不挂载）；metadata 仅发心跳（每 5s 一条，`sent=3`，mock 收到 cam_t6 共 3 条）；agent 正常退出（exit=0） |
 
-单元测试 **22/22 通过**（13 原有（含 3 个 AI）+ 9 个 Metadata）：
+单元测试 **55/55 通过**；下表为 Metadata 分支直接相关的 9 个（手部用例见 `tests/hand_wiring_tests.cpp`）：
 
 | 用例 | 断言要点 |
 |------|----------|

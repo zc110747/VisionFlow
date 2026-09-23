@@ -174,13 +174,17 @@ void StreamController::aimode_poll_loop() {
         std::string body;
         if (http_get(url, body, period_ms)) {
             const std::string mode = extract_json_string(body, "mode");
-            if (mode == "ai-y-pose") {
-                if (ai_.current_mode() != AIMode::Pose) ai_.request_mode(AIMode::Pose);
-            } else if (mode == "ai-y") {
-                if (ai_.current_mode() != AIMode::Detect) ai_.request_mode(AIMode::Detect);
+            AIMode want;
+            // aimode_from_string() rejects "ai-off" and anything unknown on
+            // purpose. ai-off means "the web stops drawing", not "load another
+            // model"; and an unrecognised token (e.g. a mode this agent build
+            // does not implement) must leave the current model alone instead of
+            // being coerced into one.
+            if (aimode_from_string(mode, want)) {
+                if (ai_.current_mode() != want) ai_.request_mode(want);
             }
-            // "ai-off" and unknown: agent keeps its current model (the web UI
-            // simply stops drawing). No notify-back is sent for ai-off.
+            // No notify-back is sent for ai-off: the agent keeps its model and
+            // the UI simply hides the overlay.
         }
         // Sleep in small slices so stop() is observed quickly.
         for (int i = 0; i < period_ms / 100 && running_; ++i)
@@ -198,9 +202,13 @@ void StreamController::start_metadata() {
         AIStatusInfo s;
         s.enable    = cfg_.ai.enable;
         s.running   = ai_.is_running();
-        s.model     = cfg_.ai.model;
+        // The model the ACTIVE mode runs, not the configured one: a switch to
+        // pose or hand changes which file is loaded, and reporting the YOLO
+        // detect model regardless would make the UI lie about the running mode.
+        s.model     = ai_.is_running() ? ai_.current_model_path() : cfg_.ai.model;
         s.last_frame_id  = last_ai_frame_id_.load();
         s.last_timestamp = last_ai_ts_.load();
+        // 17 for pose, 21 for hand, 0 for detect - one field for every mode.
         s.keypoint_count = ai_.keypoint_count();
         if (ai_.is_running()) {
             const auto a = ai_.stats();
@@ -341,10 +349,14 @@ void StreamController::run_blocking(double duration_sec) {
                     st.frames, st.dropped, st.bitrate_kbps, to_string(get_status()));
         if (ai_.is_running()) {
             const auto a = ai_.stats();
-            CA_LOG_INFO("[AI] fps={:.1f} infer={:.1f}ms track={:.2f}ms queue={} "
-                        "processed={} dropped={} objects={}",
-                        a.ai_fps, a.inference_ms, a.tracker_ms, a.queue_size,
-                        a.processed, a.dropped, a.objects);
+            // mode is on the line because the model can change underneath the
+            // operator (web UI switch), and "objects=0" means very different
+            // things in detect mode and in hand mode.
+            CA_LOG_INFO("[AI] mode={} fps={:.1f} infer={:.1f}ms track={:.2f}ms "
+                        "queue={} processed={} dropped={} objects={}",
+                        to_string(ai_.current_mode()), a.ai_fps, a.inference_ms,
+                        a.tracker_ms, a.queue_size, a.processed, a.dropped,
+                        a.objects);
         }
         if (meta_.is_running()) {
             const auto m = meta_.stats();

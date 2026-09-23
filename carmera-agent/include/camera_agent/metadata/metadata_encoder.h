@@ -18,6 +18,20 @@ namespace ca {
 //
 // bbox is clamped into the original video frame (spec 5) and expressed as
 // integers in original video pixels.
+//
+// Hand mode appends ONE additive key after "objects" (see hand_types.h):
+//
+//  ,"hand":{"detected":true,"confidence":0.99,"handedness":"right",
+//           "reference_initialized":true,
+//           "position":[x,y,z],"reference":[x,y,z],"delta":[x,y,z],
+//           "motion":{"x":"RIGHT","y":"FORWARD","z":"STATIONARY"},
+//           "gesture":"OPEN_PALM","gesture_candidate":"FIST",
+//           "gesture_confidence":1.00,
+//           "landmarks":[[x,y,z], ... 21 entries, only when enabled]}
+//
+// position/reference/delta are logical + normalised (spec 17), so they carry
+// four decimals; landmarks are original-video pixels. The key is absent on
+// detect / pose frames, which therefore stay byte-identical to earlier builds.
 std::string encode_frame_metadata(const AIFrameResult& r, const MetadataConfig& cfg);
 
 // {"version":1,"type":"status","camera_id":"...","timestamp":N,

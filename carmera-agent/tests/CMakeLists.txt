@@ -13,6 +13,7 @@ set(TEST_SOURCES
   metadata_tests.cpp
   hand_analyzer_tests.cpp
   hand_detector_tests.cpp
+  hand_wiring_tests.cpp
 )
 
 # Reuse the SIM backend sources from the app (deterministic, headless).
@@ -24,9 +25,9 @@ set(APP_SIM_SOURCES
   ${PROJECT_SOURCE_DIR}/src/pipeline/video_pipeline_sim.cpp
   ${PROJECT_SOURCE_DIR}/src/rtsp/rtsp_publisher_sim.cpp
   # AI branch: stream_controller owns an AIPipeline, so it must link too.
-  # Tests build without ONNX Runtime -> the null detector is used. The hand
-  # branch is analyzer/decode only in that configuration, which is exactly the
-  # part that has no model dependency.
+  # With ONNX Runtime present the hand tests exercise a real cascade; without
+  # it the factories return null detectors and every model-dependent case skips
+  # itself, so the pure decode / analyzer / encoder code stays covered either way.
   ${PROJECT_SOURCE_DIR}/src/ai/ai_pipeline.cpp
   ${PROJECT_SOURCE_DIR}/src/ai/byte_tracker.cpp
   ${PROJECT_SOURCE_DIR}/src/ai/yolo_detector.cpp

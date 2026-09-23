@@ -45,6 +45,39 @@ ai:
   log_objects: true
   num_threads: 2                # ONNX Runtime intra-op threads
 
+  # Mode the branch starts in: detect | pose | hand. The web UI (or the
+  # video-server aimode endpoint) can switch it at any time afterwards; this is
+  # only the state before the first request arrives, and the way to run a mode
+  # without a server. "ai-y" / "ai-y-pose" / "ai-hand" are accepted too.
+  initial_mode: detect
+
+  # ---- hand mode (Phase 1: single-hand 3D landmarks + motion + gesture) ----
+  # Same AIPipeline, same metadata endpoint - selecting "hand" only swaps which
+  # models are loaded. Nothing here can affect the video stream.
+  # Models: MediaPipe palm detection -> rotated crop -> 21 landmarks, Apache-2.0,
+  # see models/README.md for their I/O shapes and provenance.
+  hand:
+    model_palm:     models/palm_detection_mediapipe_2023feb.onnx
+    model_landmark: models/handpose_estimation_mediapipe_2023feb.onnx
+    palm_score_threshold: 0.5   # palm detector score gate
+    palm_nms_threshold:   0.3   # palm NMS IoU
+    landmark_confidence:  0.5   # landmark model confidence gate
+    max_hands: 1                # Phase 1 is single-hand: best palm wins
+    filter_alpha: 0.4           # EMA: filtered = a*now + (1-a)*prev
+    motion_deadzone: 0.02       # |delta| below this reads as STATIONARY
+    reference_stable_frames: 3  # detections before the reference point latches
+    lost_frames_to_reset:    10 # misses before the state machine restarts
+    gesture_confirm_frames:  5  # frames a gesture must hold to be confirmed
+    # Logical Y (FORWARD/BACKWARD) source:
+    #   size       apparent hand size -> monotonic with distance (default)
+    #   landmark_z the model's wrist-relative z -> describes finger ORIENTATION
+    # Kept selectable so the direction experiment can be re-run on hardware.
+    depth_source: size
+    invert_x: false             # flip a logical axis if the mount is mirrored
+    invert_y: false
+    invert_z: false
+    emit_landmarks: true        # false shrinks the metadata payload
+
 # ---- Metadata upload (Phase 2) --------------------------------------------
 # AI results are encoded as JSON and POSTed by a dedicated thread. Nothing here
 # can affect the video stream: a dead / slow / refusing server only produces

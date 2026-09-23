@@ -9,6 +9,13 @@
 // streaming thread and must never block or throw; all the work happens in this
 // class' own thread. A slow / stuck / crashed detector therefore cannot stall or
 // kill the video pipeline (spec 3.1 / spec 19).
+//
+// Three mutually exclusive modes run through this one pipeline:
+//   Detect -> one YOLO session          -> AIObject list
+//   Pose   -> one YOLO-pose session     -> AIObject list + 17 keypoints
+//   Hand   -> palm + landmark cascade   -> one AIObject + a HandState
+// Switching modes swaps which model(s) are loaded; it never adds a thread, a
+// queue or a second metadata path.
 
 #include <atomic>
 #include <condition_variable>
@@ -22,6 +29,8 @@
 
 #include "camera_agent/ai/ai_types.h"
 #include "camera_agent/ai/detector.h"
+#include "camera_agent/ai/hand_analyzer.h"
+#include "camera_agent/ai/hand_detector.h"
 #include "camera_agent/ai/tracker.h"
 
 namespace ca {
@@ -50,23 +59,37 @@ public:
 
     AIStats stats() const;
 
-    // 0 = detection model; >0 = pose model with this many keypoints per
-    // object. Valid after a successful init(), 0 otherwise.
+    // 0 = detection model; >0 = pose (17) or hand (21) keypoints per object.
+    // Valid after a successful init(), 0 otherwise.
     int keypoint_count() const {
-        // detector_ is swapped under mtx_ by the AI thread (apply_mode), while
-        // this is read from the status-provider thread - guard the read.
+        // Both detectors are swapped under mtx_ by the AI thread (install_mode),
+        // while this is read from the status-provider thread - guard the read.
         std::lock_guard<std::mutex> lk(mtx_);
+        if (current_mode_.load() == AIMode::Hand) {
+            return hand_detector_ ? hand_detector_->keypoint_count() : 0;
+        }
         return detector_ ? detector_->keypoint_count() : 0;
     }
 
+    // Path of the model the ACTIVE mode is running, for the status heartbeat.
+    // Hand runs a two-model cascade; this returns its first stage (the palm
+    // detector), which is what identifies the mode. Reporting the configured
+    // `model` here regardless of mode would tell an operator that the agent is
+    // running yolo11n while it is actually running the hand cascade.
+    std::string current_model_path() const;
+
+    // Human-readable backend of whatever is currently loaded ("none" when the
+    // branch has no model, e.g. after a failed init).
+    const char* active_backend_name() const;
+
     // --- Runtime AI mode switching (web UI -> video-server -> poller) ------
-    // Current loaded mode (Detect / Pose). Read by the status provider on a
-    // different thread, so it is atomic.
+    // Current loaded mode (Detect / Pose / Hand). Read by the status provider on
+    // a different thread, so it is atomic.
     AIMode current_mode() const { return current_mode_.load(); }
     // Request a mode change from the poller thread. Intent only - the AI thread
     // consumes it in thread_loop() and rebuilds the detector (apply_mode).
     void request_mode(AIMode m);
-    // Synchronously rebuild the detector for `m`. Returns false (and keeps the
+    // Synchronously rebuild the model(s) for `m`. Returns false (and keeps the
     // current model) on any load/init failure. Used by the AI thread and by
     // unit tests; never throws, never stops the video branch.
     bool apply_mode(AIMode m);
@@ -74,6 +97,13 @@ public:
 private:
     void thread_loop();
     void process(AIFrame& f);
+    // Hand-mode frame: cascade -> analyzer -> AIFrameResult.hand. Split out so
+    // the detect/pose path in process() stays exactly as it was.
+    void process_hand(AIFrame& f);
+    // Build + install the model(s) for `m`; false leaves the previous one in
+    // place. Silent on success - the callers log, because "loaded at startup"
+    // and "switched by the web" are different events.
+    bool install_mode(AIMode m);
     void log_periodic_locked();
 
     AIConfig  cfg_{};
@@ -81,8 +111,15 @@ private:
     // Sub-sampling interval in ms; 0 means "process every frame".
     int64_t   interval_ms_ = 0;
 
-    std::unique_ptr<IDetector> detector_;
-    std::unique_ptr<ITracker>  tracker_;
+    std::unique_ptr<IDetector>     detector_;        // Detect / Pose
+    std::unique_ptr<IHandDetector> hand_detector_;   // Hand
+    std::unique_ptr<ITracker>      tracker_;         // Detect / Pose only
+    // Hand temporal state (reference / EMA / gesture latch). Lives for the whole
+    // lifetime of the pipeline so a Detect<->Hand switch does not have to
+    // reallocate it; install_mode() resets it instead, so no stale reference
+    // survives a mode change.
+    HandAnalyzer   hand_analyzer_;
+    bool           hand_ready_ = false;   // hand_analyzer_ configured OK
 
     // Current loaded mode. Written only by the AI thread; read atomically.
     std::atomic<AIMode> current_mode_{AIMode::Detect};

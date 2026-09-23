@@ -11,20 +11,33 @@
 // the network input space (640x640).
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "camera_agent/ai/hand_types.h"
 #include "camera_agent/ai/keypoint.h"
 
 namespace ca {
 
 // Runtime AI mode requested by the web UI (via the video-server aimode
 // endpoint). Detect = person detection only; Pose = person detection + 17
-// COCO keypoints. The agent keeps its own model loaded and swaps it on demand.
-enum class AIMode : int { Detect = 0, Pose = 1 };
+// COCO keypoints; Hand = single-hand 3D landmarks + motion + gesture (a
+// two-model cascade, see hand_detector.h). The agent keeps its own model
+// loaded and swaps it on demand.
+//
+// Hand is deliberately a fourth *mode*, not a fourth pipeline: it runs on the
+// same AIPipeline thread, off the same frame tap, into the same
+// MetadataManager. Selecting it replaces the loaded detector; nothing else in
+// the agent changes shape.
+enum class AIMode : int { Detect = 0, Pose = 1, Hand = 2 };
 
 inline const char* to_string(AIMode m) {
-    return m == AIMode::Pose ? "pose" : "detect";
+    switch (m) {
+        case AIMode::Pose: return "pose";
+        case AIMode::Hand: return "hand";
+        default:           return "detect";
+    }
 }
 
 // Wire vocabulary shared with video-server (model.go AIModeDetect / AIModePose)
@@ -33,7 +46,26 @@ inline const char* to_string(AIMode m) {
 // frames whose mode no longer matches the selected mode. "ai-off" is never
 // stamped here - it is web-only (the overlay is hidden but the model stays).
 inline const char* aimode_web_string(AIMode m) {
-    return m == AIMode::Pose ? "ai-y-pose" : "ai-y";
+    switch (m) {
+        case AIMode::Pose: return "ai-y-pose";
+        case AIMode::Hand: return "ai-hand";
+        default:           return "ai-y";
+    }
+}
+
+// Translate a mode token into an AIMode. Both vocabularies are accepted: the
+// short form used by the CLI / YAML ("detect" / "pose" / "hand") and the wire
+// form the video-server speaks ("ai-y" / "ai-y-pose" / "ai-hand").
+//
+// Returns false for "ai-off" and for anything unrecognised, and that is
+// deliberate: "ai-off" means "the web stops drawing, the agent keeps its
+// model", so turning it into a model switch would be wrong - and an unknown
+// token must leave the current mode alone rather than guess.
+inline bool aimode_from_string(const std::string& s, AIMode& out) {
+    if (s == "detect" || s == "ai-y")      { out = AIMode::Detect; return true; }
+    if (s == "pose"   || s == "ai-y-pose") { out = AIMode::Pose;   return true; }
+    if (s == "hand"   || s == "ai-hand")   { out = AIMode::Hand;   return true; }
+    return false;
 }
 
 // One detected + tracked object.
@@ -58,10 +90,17 @@ struct AIFrameResult {
     int      video_width  = 0;
     int      video_height = 0;
     std::vector<AIObject> objects;
-    // Mode the agent ACTUALLY ran to produce this frame ("ai-y" / "ai-y-pose").
-    // Stamped per frame so the web can drop transition frames whose mode no
-    // longer matches the selected mode (see aimode_web_string).
+    // Mode the agent ACTUALLY ran to produce this frame ("ai-y" / "ai-y-pose" /
+    // "ai-hand"). Stamped per frame so the web can drop transition frames whose
+    // mode no longer matches the selected mode (see aimode_web_string).
     std::string ai_mode;
+
+    // Hand payload. Engaged ONLY when the frame was produced by AIMode::Hand -
+    // an engaged value means "this frame carries the hand fields", including
+    // the honest case of a hand frame where no hand was found
+    // (hand->detected == false). Detect / pose frames leave it disengaged, so
+    // the encoder keeps emitting byte-identical JSON for those modes.
+    std::optional<HandState> hand;
 };
 
 // Raw frame handed from the video pipeline to the AI pipeline.
@@ -123,6 +162,20 @@ struct AIConfig {
     // metadata.server_url (everything up to "/api/metadata") so the operator
     // only configures ONE endpoint. An explicit value here always wins.
     std::string aimode_base_url = "";
+
+    // Mode the branch starts in, before any web request arrives. Exist so the
+    // hand mode (and pose) can be exercised on hardware without a running
+    // server - the aimode endpoint is the only other way in.
+    //
+    // Detect keeps the historical behaviour: the configured `model` is loaded
+    // and, if it turns out to be a pose ONNX, the mode self-reports as Pose.
+    AIMode      initial_mode = AIMode::Detect;
+
+    // --- Hand mode (Phase 1) ------------------------------------------------
+    // Owned here (not in a global) so every knob of the hand branch is reached
+    // through the same configuration chain as the rest of AI: defaults -> YAML
+    // -> CLI. See hand_types.h for what each field means.
+    HandConfig  hand;
 };
 
 // Runtime statistics of the AI pipeline (spec 16).

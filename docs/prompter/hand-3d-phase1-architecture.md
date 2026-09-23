@@ -175,7 +175,7 @@ camera ──tee──┬──► video pipeline ──────────
 | **P1a** | 校准 anchor 表 + 2 个 ONNX 入库 + 黄金夹具 | 全 2016 值比对 + 模型 SHA-256 入档 | ✅ 完成并提交 |
 | **P1b** | `HandDetector`：palm → 旋转裁切 → landmark，含自实现重采样/仿射/解码 | 黄金比对 **dx 0.00034 px** | ✅ 完成并提交 |
 | **P1c** | `HandAnalyzer`：坐标映射 / EMA / reference / deadzone / motion / gesture 去抖 | 13 个无模型单测全绿 | ✅ 完成并提交 |
-| **P1d** | 接线：`AIMode::Hand` + `hand` metadata 编码 + config/CLI | 双构零警告 | 待开始 |
+| **P1d** | 接线：`AIMode::Hand` + `hand` metadata 编码 + config/CLI | 双构零警告 | ✅ 完成并提交 |
 | **P1e** | P1 验收：真机 720p@30 出 `ai-hand` 帧 + 补 fist 夹具定 `kCurledRatio` | 全链路真机跑通（需举手配合） | 待开始 |
 | **P2** | server：schema 增量列 + `hand` 解码/校验 + append-only `ai_hand_log` 录制器 + `hand_session_*.json` 导出 + `ai-hand` 放行 | `go test ./...` 全绿 + 真机 metadata 落库 | 待开始 |
 | **P3** | 前端：21 点手部骨架 overlay + HUD + `HandPanel` 调试面板 + `ai-hand` 按钮（只消费 metadata） | 构建零错误 + 无头渲染断言 | 待开始 |
@@ -235,4 +235,53 @@ fist 图 —— 这是本阶段显式标注的未验证项，不是遗漏。
 5. **`rc.exe` / `mt.exe` 不在手工 PATH 上**。Debug 目录首次配置会因 `CMAKE_RC_COMPILER` 找不到而
    判定 "compiler broken"，实际与代码无关 —— 需要把
    `C:\Program Files (x86)\Windows Kits\10\bin\<ver>\x64` 加进 PATH。
+
+---
+
+## 10. P1d 接线决策记录（后续 P2/P3 必须按此实现）
+
+### 10.1 `hand` 字段为什么是 optional，而不是"总在的结构体"
+
+`AIFrameResult::hand` 是 `std::optional<HandState>`，只有 Hand 模式才 engage。
+编码器因此能在**不判断模式**的前提下保证：detect / pose 帧的 JSON 与手部功能出现之前**逐字节相同**。
+
+这不是洁癖 —— `metadata_encoder.cpp` 是两条链路共用的唯一序列化点，一旦它按 `ai_mode` 分支，
+就多了一处"模式字符串写错导致报文变形"的可能。单测用**固定整串**钉住了两个方向的输出：
+
+| 用例 | 断言 |
+|---|---|
+| `hand_absent_on_detect_frame` | 整帧 JSON 等于字面量，且不含 `hand` |
+| `hand_absent_on_pose_frame` | 同上 + `keypoints` 仍是 `[x,y,conf]` 且仍是对象最后一个字段 |
+| `hand_block_is_appended_after_objects` | hand 帧整串等于字面量（含 `hand` 块的完整字段顺序） |
+
+### 10.2 关键点为什么放两处
+
+| 位置 | 内容 | 精度 | 用途 |
+|---|---|---|---|
+| `objects[0].keypoints` | `[x,y,conf]` | x/y 被 `lround` 取整 | 复用通用绘制路径（canvas 按像素画） |
+| `hand.landmarks` | `[x,y,z]` | 2 位小数，像素尺度 | 唯一带 z 的地方；也是 `emit_landmarks=false` 时一起消失的那份 |
+
+共享的 `keypoints` 三元组是 **pose 的契约**，给它加第 4 位会让每个消费方都变成"变长数组"解析；
+而第三维只对手有意义，所以放在 hand 块里。代价是 x/y 冗余了一份（12fps × ~500B 可忽略）。
+
+### 10.3 `install_mode` / `apply_mode` 拆开，以及"启动自动识别"为何只留在 `init()`
+
+- `install_mode(m)`：只做"加载 + 原子换指针"，失败时**上一个模型原封不动**（因为换指针严格发生在加载成功之后）。
+- `apply_mode(m)`：`install_mode` + 打一条 "model switched" 日志。启动时不该出现"switched"（那时还没切过任何东西）。
+- 旧的"`--ai-model` 指向 pose ONNX 就自动报 Pose"逻辑**只保留在 `init()`**：如果把它搬进 `apply_mode`，
+  运行期 Web 点"人检测"而 `ai.model` 恰好是 pose 文件时，agent 会回一个 `ai-y-pose`，
+  前端按模式门控会**丢弃所有帧**——表现成"AI 坏了"。运行期的显式请求必须被逐字执行。
+- 两个模式**互斥持有模型**：切到 Hand 就释放 YOLO session（反之亦然）。失败路径不释放，所以"切换失败后没有模型"不可能发生。
+
+### 10.4 模式 token 只有一个解析点
+
+`aimode_from_string()`（`ai_types.h`）同时服务 YAML、CLI、aimode 轮询器。它**故意拒绝** `ai-off`
+与任何未知 token：
+
+- `ai-off` 的语义是"Web 停止绘制"，不是"换一个模型"；把它翻译成模型切换会加载没人要的模型。
+- 未知 token（例如 video-server 加了新模式而 agent 还没升级）必须**保持现状**，不能猜一个最接近的。
+
+CLI 与 YAML 的区别只在错误处理：CLI 打错是 `exit 2`（操作者刚敲的），YAML 打错是 WARN + 保持默认
+（配置文件里的一个手误不该让整次运行失败）。`depth_source` 同样按闭集校验，因为它一旦落到
+mapper 的默认分支，"方向实验"就会在操作者以为测了另一个轴的情况下给出结论。
 

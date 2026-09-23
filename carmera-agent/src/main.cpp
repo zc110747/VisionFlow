@@ -53,6 +53,15 @@ static void print_help() {
         "                      and pose models are auto-detected; e.g.\n"
         "                      models/yolo11n-pose.onnx adds 17 keypoints per person\n"
         "  --ai-model-pose <path>  Pose model (default models/yolo11n-pose.onnx)\n"
+        "  --ai-mode <mode>   Mode the branch starts in: detect | pose | hand\n"
+        "                      (default detect). The web UI can switch it later.\n"
+        "                      Equivalent to the server's ai-y | ai-y-pose | ai-hand\n"
+        "  --ai-hand-palm <path>      Hand palm-detector ONNX\n"
+        "  --ai-hand-landmark <path>  Hand landmark ONNX (21 keypoints)\n"
+        "  --ai-hand-depth <src>      Hand depth axis source: size | landmark_z\n"
+        "                              (default size)\n"
+        "  --ai-hand-invert-x|-y|-z   Flip one logical axis of the hand frame\n"
+        "  --no-ai-hand-landmarks     Drop the 21 landmarks from the payload\n"
         "  --ai-aimode-base <url>  video-server HTTP base for mode polling\n"
         "                          (default http://127.0.0.1:8081)\n"
         "  --ai-aimode-poll-ms <n> mode poll period in ms (default 2000)\n"
@@ -135,6 +144,11 @@ int main(int argc, char** argv) {
         bool ai_model_pose=false, ai_aimode_base=false, ai_aimode_poll_ms=false, ai_aimode_off=false;
         std::string ai_model_pose_v, ai_aimode_base_v;
         int  ai_aimode_poll_ms_v=0;
+        // Initial AI mode + hand (Phase 1) overrides
+        bool ai_mode=false, ai_hand_palm=false, ai_hand_landmark=false, ai_hand_depth=false;
+        bool ai_hand_inv_x=false, ai_hand_inv_y=false, ai_hand_inv_z=false;
+        bool ai_hand_no_lm=false;
+        std::string ai_mode_v, ai_hand_palm_v, ai_hand_landmark_v, ai_hand_depth_v;
         // Metadata overrides
         bool md=false, md_no=false, md_url=false, md_cam=false, md_queue=false;
         bool md_timeout=false, md_hb=false, md_log_payload=false, md_insecure=false;
@@ -178,6 +192,17 @@ int main(int argc, char** argv) {
                                            cli.ai_model_pose_v = get_val(i++, "--ai-model-pose"); }
         else if (a == "--ai-aimode-base") { cli.ai_aimode_base = true;
                                             cli.ai_aimode_base_v = get_val(i++, "--ai-aimode-base"); }
+        else if (a == "--ai-mode")   { cli.ai_mode = true; cli.ai_mode_v = get_val(i++, "--ai-mode"); }
+        else if (a == "--ai-hand-palm") { cli.ai_hand_palm = true;
+                                          cli.ai_hand_palm_v = get_val(i++, "--ai-hand-palm"); }
+        else if (a == "--ai-hand-landmark") { cli.ai_hand_landmark = true;
+                                              cli.ai_hand_landmark_v = get_val(i++, "--ai-hand-landmark"); }
+        else if (a == "--ai-hand-depth") { cli.ai_hand_depth = true;
+                                           cli.ai_hand_depth_v = get_val(i++, "--ai-hand-depth"); }
+        else if (a == "--ai-hand-invert-x") cli.ai_hand_inv_x = true;
+        else if (a == "--ai-hand-invert-y") cli.ai_hand_inv_y = true;
+        else if (a == "--ai-hand-invert-z") cli.ai_hand_inv_z = true;
+        else if (a == "--no-ai-hand-landmarks") cli.ai_hand_no_lm = true;
         else if (a == "--ai-aimode-poll-ms") { cli.ai_aimode_poll_ms = true;
                                                cli.ai_aimode_poll_ms_v = std::atoi(get_val(i++, "--ai-aimode-poll-ms").c_str()); }
         else if (a == "--no-ai-aimode") cli.ai_aimode_off = true;
@@ -238,6 +263,33 @@ int main(int argc, char** argv) {
     if (cli.ai_aimode_base) cfg.ai.aimode_base_url = cli.ai_aimode_base_v;
     if (cli.ai_aimode_poll_ms) cfg.ai.aimode_poll_ms = cli.ai_aimode_poll_ms_v;
     if (cli.ai_aimode_off)      cfg.ai.aimode_poll    = false;
+    if (cli.ai_mode) {
+        // Same parser the YAML and the aimode poller use, so a mode can only
+        // ever be spelled one way in this codebase. An unknown token is a hard
+        // error here (unlike in the YAML): the operator typed it just now.
+        if (!ca::aimode_from_string(cli.ai_mode_v, cfg.ai.initial_mode)) {
+            CA_LOG_ERROR("Unknown --ai-mode '{}' (expected detect | pose | hand)",
+                         cli.ai_mode_v);
+            return 2;
+        }
+    }
+    if (cli.ai_hand_palm)     cfg.ai.hand.model_palm     = cli.ai_hand_palm_v;
+    if (cli.ai_hand_landmark) cfg.ai.hand.model_landmark = cli.ai_hand_landmark_v;
+    if (cli.ai_hand_depth) {
+        // Closed vocabulary, same as the YAML path: an unknown value would fall
+        // through the mapper's default branch and silently make the depth
+        // experiment report the wrong axis.
+        if (cli.ai_hand_depth_v != "size" && cli.ai_hand_depth_v != "landmark_z") {
+            CA_LOG_ERROR("Unknown --ai-hand-depth '{}' (expected size | landmark_z)",
+                         cli.ai_hand_depth_v);
+            return 2;
+        }
+        cfg.ai.hand.depth_source = cli.ai_hand_depth_v;
+    }
+    if (cli.ai_hand_inv_x)    cfg.ai.hand.invert_x       = true;
+    if (cli.ai_hand_inv_y)    cfg.ai.hand.invert_y       = true;
+    if (cli.ai_hand_inv_z)    cfg.ai.hand.invert_z       = true;
+    if (cli.ai_hand_no_lm)    cfg.ai.hand.emit_landmarks = false;
     if (cli.ai_w)      cfg.ai.input_width   = cli.ai_w_v;
     if (cli.ai_h)      cfg.ai.input_height  = cli.ai_h_v;
     if (cli.ai_queue)  cfg.ai.queue_size    = cli.ai_queue_v;

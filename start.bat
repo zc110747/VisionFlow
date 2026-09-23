@@ -35,6 +35,7 @@ REM    NO_BROWSER      1 = do not open the browser              (default 0)
 REM    ENABLE_AI       1 = run person detection in the agent     (default 1)
 REM    ENABLE_METADATA 1 = push AI results to the server         (default 1)
 REM    AI_FPS          AI inference rate, range 5-12             (default 8)
+REM    AI_MODE         AI mode: detect|pose|hand                (default detect)
 REM    METADATA_URL    full ingest URL                           (default below)
 REM    VS_CONFIG       server config file name inside config\    (default config.joint.yaml)
 REM    NO_PAUSE        1 = do not wait for a keypress at the end (default 0)
@@ -46,6 +47,7 @@ REM    start.bat --camera 0 --stream cam01
 REM    start.bat --no-browser
 REM    start.bat --no-ai                 (plain stream, no boxes)
 REM    start.bat --ai-fps 10             (10 inferences/sec)
+REM    start.bat --ai-mode hand          (hand 3D landmarks + gesture, no server UI needed)
 REM    start.bat --source videotestsrc   (no physical camera needed)
 REM    start.bat --probe                 (also self-test the running stack)
 REM
@@ -133,6 +135,7 @@ for %%a in (%*) do (
     if "!_ctx!"=="stream" set "STREAM_ID=%%~a"
     if "!_ctx!"=="source" set "CAMERA_SOURCE=%%~a"
     if "!_ctx!"=="aifps"  set "AI_FPS=%%~a"
+    if "!_ctx!"=="aimode" set "AI_MODE=%%~a"
     set "_ctx="
   ) else (
     if /i "%%a"=="--no-browser"   set NO_BROWSER=1
@@ -142,6 +145,7 @@ for %%a in (%*) do (
     if /i "%%a"=="--stream"       set "_ctx=stream"
     if /i "%%a"=="--source"       set "_ctx=source"
     if /i "%%a"=="--ai-fps"       set "_ctx=aifps"
+    if /i "%%a"=="--ai-mode"      set "_ctx=aimode"
     if /i "%%a"=="--ai"           set ENABLE_AI=1
     if /i "%%a"=="--no-ai"        set ENABLE_AI=0
     if /i "%%a"=="--metadata"     set ENABLE_METADATA=1
@@ -315,6 +319,9 @@ REM ---- (8) start camera-agent, pushing at the SAME MediaMTX ------------
 REM AI / metadata flags are appended only when enabled. In this script they are
 REM ON by default, so the browser overlay has frames to draw.
 if "%ENABLE_AI%"=="1" set "AI_ARG=--ai --ai-fps %AI_FPS%"
+REM Delayed expansion (!AI_ARG!) matters here: the mode and the metadata flags are
+REM appended in sequence and %AI_ARG% would be frozen at parse time.
+if defined AI_MODE if "%ENABLE_AI%"=="1" set "AI_ARG=!AI_ARG! --ai-mode !AI_MODE!"
 if "%ENABLE_METADATA%"=="1" (
   if not defined METADATA_URL set "METADATA_URL=http://127.0.0.1:%HTTP_PORT%/api/metadata"
   REM Delayed expansion on purpose: %AI_ARG% inside a parenthesised block
