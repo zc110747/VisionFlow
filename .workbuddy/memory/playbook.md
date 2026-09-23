@@ -24,8 +24,9 @@
 - 工具路径（脚本内自动探测，**不要硬编码**）：
   `mediamtx` = `D:\data\agent-tools\mediamtx_v1.20.1_windows_amd64`；
   `ffmpeg/ffprobe` = `D:\data\agent-tools\ffmpeg-master-latest-win64-gpl-shared\bin`。
-- 真机摄像头：`LRCP USB2.0`（1280×720@30）、内置 `Integrated Camera`（1280×720@10）；
-  枚举用 `camera-agent --list`。
+- 真机摄像头：`LRCP USB2.0`（1280×720@30）。
+  ⚠️ `--list` 会把它列成 **两条**（同一台设备枚举两次），**只有 `--camera 0` 能真正上流**，
+  `--camera 1` 报 `Failed to start`。枚举用 `camera-agent --list`，可用性必须实跑确认。
 
 ---
 
@@ -111,8 +112,12 @@ start.bat --source videotestsrc --no-browser --no-pause --probe
   --ai/--no-ai/--metadata/--no-metadata`），**新增** `--probe`（跑 API 自检）、
   `--no-pause`（收尾不等按键）。环境变量同名可用（`PROBE=1`、`NO_PAUSE=1`）。
 - 文件必须 **CRLF 换行**（LF 会让 `call :label` 间歇失败，见用户级 playbook §4.2）。
-- ⚠️ **本机没有可用 UVC 摄像头**（`camera-agent.exe --list` → `No cameras found.`），
-  验证全链路必须加 `--source videotestsrc`；不加则 agent 一直重连、`camera01` 永不注册。
+- ⚠️ **摄像头以「实际能否上流」为准，别看 `--list`**（2026-09-23 更正）：
+  `--list` 里的两条 `LRCP USB2.0` 是**同一台物理设备被枚举两次**，
+  `--camera 1` 起流即 `gst_base_src_start / Failed to start`
+  （`camera busy / unavailable?`）⇒ **本机只有 `--camera 0` 可用**。
+  当天插着摄像头时 `--list` 能列出且 index 0 正常出 1280×720@30。
+  没插摄像头时 `--list` → `No cameras found.`，此时验证全链路必须 `--source videotestsrc`。
 - ⚠️ 沙箱会在工具调用返回时**回收 `start ""` 起的子进程**（与 §3 一致）⇒
   启动器自己打印的 `[OK] ... healthy` / `registered` 与 `--probe` 就是**唯一可信的运行态证据**；
   不要在调用返回后再去 curl。`--probe` 正是为此加的（13 项 PASS）。
@@ -163,7 +168,7 @@ start.bat --source videotestsrc --no-browser --no-pause --probe
 
 ---
 
-## §7 手部 3D 识别分支（2026-09-23，P1a–P1c 已提交 `5eeee73`）
+## §7 手部 3D 识别分支（2026-09-23，P1a–P1e 已提交 `5eeee73` / `b6edeb3` / `e9e8b8c`）
 
 ### 7.1 模型与几何（**改这些数字前先读 `carmera-agent/models/README.md`**）
 
@@ -191,15 +196,33 @@ idx 1152..2015  stride 16 12×12 网格 × 6 锚/格
 ### 7.3 验收与判据
 
 ```bash
-# 单测（44 个，其中 11 个无模型也能跑）
-./build-msvc/tests/camera-agent-tests.exe
+# 单测（56 个，其中 11 个无模型也能跑）
+./build-msvc/tests/camera-agent-tests.exe        # 需 PATH 含 gstreamer bin + onnxruntime/lib
 ctest --test-dir build-msvc --output-on-failure
 ```
 实测成绩（与官方参考同 ORT 后端）：21 点 **dx 0.00034 / dy 0.00079 / dz 0.00173 px**、
-bbox 0.00065 px、anchor 选择逐位相同。详见 `tests/golden/README.md`。
+bbox 0.0005 px、anchor 全 2016 值 worst diff **7.45058e-09**。详见 `tests/golden/README.md`。
 
-**唯一还没实测的数字**：`kCurledRatio = 0.90`（握拳侧）。夹具里没有握拳样本，
-必须真机补一张 fist 图才能定 —— 这是显式标注的未验证项。
+**手势阈值已全部实测（P1e）**，见架构文档 §11：
+
+| 常量 | 值 | 出处 |
+|---|---|---|
+| `kExtendedRatio` | 1.15 | 黄金夹具开掌 1.59–1.84（留足余量） |
+| `kCurledRatio` | **1.10** | 真机握拳簇上沿 0.983 / 开掌簇下沿 1.429 ⇒ 1.10 取中间 |
+| `kGestureVote` | 0.75 | 四指里要 3 指一致 |
+
+⚠️ **`kCurledRatio` 必须 < `kExtendedRatio`**：`hand_classify_gesture()` 是 `if / else if`，
+**死区就是 `[kCurledRatio, kExtendedRatio]`**，两者交叉会让死区**静默失效**而不报错。
+`hand_gesture_open_fist_ambiguous` 有 1.09/1.16 两个边界断言专门防这个。
+
+⚠️ **index 指握拳时永不投 curled**（MCP5 离腕最近，比值仍 1.2–1.4）⇒ FIST 只靠
+middle/ring/pinky 三指，**恰好卡在 `kGestureVote=0.75` 的等号上**，三指缺一即丢。
+
+**标定方法（可复用）**：`hand.landmarks` 是**像素坐标 2 位小数**，精度远高于要标定的
+ratio ⇒ **报文本身就够标定，不用改代码不用重编**。脚本
+`tests/finished/p1e-smoke/analyze_hand_log.py`（`--tail` / `--gesture` / `--msg-from/-to`
+/ `--timeline` / `--hist`，含 Otsu）。⚠️ **Otsu 会被过渡帧拉偏**（过渡帧在构造上落在谷底
+且数量占优）⇒ 脚本已强制钳到 `kExtendedRatio - 0.05`；**标定姿势必须保持不动**。
 
 ### 7.4 坑（本项目专属，方法论已升级到全局 playbook §11）
 
@@ -211,3 +234,10 @@ bbox 0.00065 px、anchor 选择逐位相同。详见 `tests/golden/README.md`。
    `./build_oneclick.bat --no-pause < /dev/null`；要精确控制 target 或 `grep` 零警告，
    用手工 MSVC env（全局 §7.4），注意 **Debug 首配需要 SDK 的 `rc.exe`/`mt.exe`**。
    `build_oneclick.bat` 默认后端 = gstreamer，与现有 `build-msvc` 一致。
+4. **链接报 `LNK1104: 无法打开文件 src\camera-agent.exe` = exe 正被占用**，
+   多半是后台还在跑采集窗口 ⇒ **先停采集再构建**。
+5. **构建日志别写 `/tmp`**（`tee /tmp/x.log` → Permission denied，本环境 `/tmp` 不落文件），
+   写项目目录。`source scripts/msvc-env.sh` 前若报「could not detect MSVC toolset」，
+   是 `sort -V` 被 System32 遮蔽（脚本已修，优先 `/usr/bin/sort`）。
+6. `tasklist //FI "IMAGENAME eq x.exe"` **静默返回空**（System32 垫片接管）——
+   要判"还有没有进程"只能用 `tasklist | grep -i x`。
