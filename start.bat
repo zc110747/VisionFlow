@@ -196,6 +196,16 @@ if defined GO_BIN (
     if "%REBUILD%"=="" (
       if not exist "%ROOT%\web\dist\index.html" set "REBUILD=STALE"
     )
+    REM web/dist is embedded into the exe at COMPILE time, so a dist NEWER
+    REM than the binary means the running UI is stale even when no Go file
+    REM changed. Without this, a frontend-only change that was already built -
+    REM by hand, by npm run build, or by an agent - starts the OLD web UI and
+    REM the new code looks like it silently did nothing.
+    REM NOTE: no parentheses in these comments. Inside a parenthesised block a
+    REM ")" closes the block early, swallowing the rest of the branch.
+    if "%REBUILD%"=="" (
+      for /f "usebackq tokens=*" %%i in (`powershell -NoProfile -Command "if ((Get-Item -LiteralPath '%ROOT%\web\dist\index.html').LastWriteTime -gt (Get-Item -LiteralPath '%VS_EXE%').LastWriteTime) { 'STALE' }" 2^>nul`) do set "REBUILD=%%i"
+    )
     if "%REBUILD%"=="" (
       for /f "usebackq tokens=*" %%i in (`powershell -NoProfile -Command "$d = Get-Item -LiteralPath '%ROOT%\web\dist\index.html'; $g = @(Get-ChildItem -LiteralPath '%ROOT%\web\src' -Recurse); $m = $d.LastWriteTime; foreach ($f in $g) { if ($f.LastWriteTime -gt $m) { $m = $f.LastWriteTime } }; if ($m -gt $d.LastWriteTime) { 'STALE' }" 2^>nul`) do set "REBUILD=%%i"
     )
