@@ -700,5 +700,106 @@ x ∈ [128.27, 1083.79] 全部落在 `[0,1280]` 内，但 **y 有 1070 个点 > 
 - 真机 `detected=1` 帧的**画面**与 `landmarks` 的像素对齐（overlay 是否会盖准）
   属于 P3 的活儿，本阶段只验到"数据原样到库、原样出文件"。
 
+---
+
+## 14. P3 实证记录：Web 端手部骨架 / HUD / 面板（2026-09-23）
+
+### 14.1 先说结论：这一阶段**不需要重新举手**
+
+上一节把"画面与 landmark 的像素对齐"划给 P3，隐含前提是"要再举一次手"。实际不需要：
+`ai_hand_log` 是 append-only 的，而 `hand.landmarks` 是**原字节**保真存的（13.3），
+所以库里已经有真机跑出来的手部数据。本轮验证直接走
+`GET /hand/sessions/{i}` 把真实帧取出来喂给前端模块。
+
+本轮用的样本：两个会话共 **1078 帧 `detected=1`**，其中 **1078/1078 帧带全 21 点**
+（`session 168` 559 帧、`session 478` 519 帧 / 420 OPEN_PALM）。
+
+> 这条对以后所有"要真机数据才能验前端"的场景都成立：**先查录制库，再决定要不要人配合**。
+> 人配合留给只有人能做到的事 —— 比如镜头里真的出现一只手。
+
+### 14.2 验收数字（原始）
+
+```
+npm run check（SFC script 类型检查）      -> checked 7 SFC script block(s) / SFC-CHECK: clean
+vite build                                -> built in 8.34s（产物 index-DxMMt9zy.js 1,067.96 kB）
+go build                                  -> 二进制内嵌 assets/index-DxMMt9zy.js（与 dist 一致）
+python scripts/verify_hand_overlay.py     -> PASS=41  FAIL=0  SKIP=0
+```
+
+overlay 几何断言（用记录型 2D context 抓真实绘制调用）：
+`strokes=21`（骨）/ `arcs=27`（21 关节 + 5 指尖 + 1 腕）；每个 landmark 都画在
+`原值×缩放` 的**精确位置**（即未被 clamp）；人工构造的越界点 `y=4000` 原样传到 canvas；
+20 点或缺失的数组 → `calls=0`（不画任何东西）。
+
+### 14.3 三条直接影响实现的实证
+
+1. **`objects[]` 在 hand 帧里不是空的。** `ai_pipeline.cpp` 在检测到手时会塞一条
+   `class="hand"` 的记录，`keypoints` 就是那 21 点。所以在此之前，"手部模式"在页面上
+   的表现是**有方框、没有骨架** —— 根因是 overlay 用 `keypoints.length === 17`
+   判断是否画骨架，21 点永远落不进那个分支。这是本轮唯一的"用户可见缺陷"。
+2. **landmark 越界是常态，不是异常。** 本轮 1078 帧 **样本里有 1271 个坐标落在画面外**
+   （`x∉[0,1280]` 或 `y∉[0,720]`，画面 1280×720）。与 13.x 的结论一致：agent 只 clamp
+   bbox。所以 overlay 的"不 clamp + 交给 canvas 裁"是被实测支撑的，不是偷懒。
+3. **`handedness` 目前恒为 `"unknown"`**（landmark 模型报的值没有被采用）。
+   前端必须把 unknown 当正常状态渲染，不能等它变成 left/right 才显示。
+
+### 14.4 骨架只画一次：一条不能破的同源契约
+
+`o.keypoints = hs.landmarks` —— objects 里的 hand 对象与 `hand` 块是**同一份**数据。
+于是 overlay 只从 `hand.landmarks` 画一次，objects 循环对 hand 帧跳过骨架。
+两处都画会叠成双层：**平时完全看不出来**（两个骨架像素级重合），
+一旦哪天两者不同步（例如 agent 改了裁剪但又只改了其中一处），
+画面会突然出现"两个手"的错觉。探针里有一条断言专门钉这个契约，
+把 `objects[0].keypoints` 与 `hand.landmarks` 逐点比对（容差 1e-6）。
+
+### 14.5 `delta` 必须被门控，否则会被读成"跟踪跳变"
+
+`reference_initialized=false` 期间，`delta` 是相对于**零原点**的差值 —— 数值上等于
+绝对位置。直接显示出来，操作者看到的就是"手一进画面就飞了一大段"。
+协议明文写了"consumers MUST NOT consume delta before this flag"，所以 HUD 显示 `—`
+并标注 `REF LATCHING`，锁定后转 `REF LOCKED`。这条既有单测（人工构造的前/后锁定状态）
+也有内联注释，避免以后被"优化"掉。
+
+### 14.6 无浏览器验收覆盖到哪一层
+
+| 层 | 覆盖 | 手段 |
+|---|---|---|
+| 逻辑（拓扑 / HUD 派生 / 契约） | ✅ | esbuild 打包**前端自己的模块**，Python 喂活 payload |
+| 几何（canvas 调用参数） | ✅ | 记录型 2D context，断言坐标与条数 |
+| 组件 markup | ✅ | Vite `ssrLoadModule` + `@vue/server-renderer`，扫 `undefined`/`NaN` + 正样本 + 空态 |
+| canvas 实际像素 | ❌ | 必须真浏览器 |
+| WebRTC 视频层 / 200ms 轮询 / 模式切换往返 | ❌ | 必须真浏览器 |
+
+脚本结尾会把这四条"未覆盖"打印出来 —— 一个绿勾不该假装成"全都测过了"。
+正样本锚点一律取自**活 payload**（如 `OPEN_PALM`、`0.00`），并且特意挑一个
+**非 UNKNOWN** 的手势帧：`UNKNOWN` 会"因为字段没绑定也正好显示 UNKNOWN"而蒙混过关。
+
+### 14.7 本轮抓到的两个真实缺陷
+
+1. **删了 import 却留下引用，构建全绿、运行时 ReferenceError。**
+   `web/src` 里所有 `<script setup>` 都是类型检查盲区：`tsc` 不读 `.vue`，
+   `vite build` / esbuild 只转译不做未定义标识符检查。本轮把 HUD 抽成组件时删掉了
+   `buildHandHud` 的 import，却在同一文件里留了一个引用它的 `computed` ——
+   `vite build` 成功返回，只有浏览器打开才会白。已补 `web/tools/check-sfc.mjs`
+   （`npm run check`）：抽出每个 SFC 的 script 块、补上编译器宏声明、交给 `tsc`，
+   行号映射回 `.vue`。补上之后立刻证明了自己的价值（首次运行就有真发现）。
+2. **`start.bat` 会静默起旧 Web UI。** 它的重建判断是"`web/src` 是否比 `web/dist` 新"，
+   但 `web/dist` 是**编译期** embed 进 exe 的：dist 已经构建过、exe 还没重编时
+   （手工 `npm run build`、CI、或 agent 代跑构建），三个条件全不成立 → 不重建 →
+   新前端看起来"什么都没发生"。已补一条"dist 比 exe 新即视为 STALE"。
+
+> 关于缺陷 1 的成因，有一条工具用法上的教训：**同一条消息里对同一个文件发多个编辑，
+> 后一个会基于旧快照写回，静默回滚前一个，而每一个都返回"成功"。**
+> 定稿前必须回到文件里核对（本次就是靠 `grep` 复核抓到的）。改 `.bat` 还要额外查
+> CRLF：`Edit` 会保留原有行尾，但**括号块内的 `)` 会提前闭合分支**，注释里也不能出现括号。
+
+### 14.8 仍未验证（需要人配合）
+
+- **overlay 与画面的像素对齐**：探针证明的是"坐标算对了"，不是"落在手上的位置对"。
+  需要真机举手、肉眼确认骨架贴手。
+- **HUD 的实时性**：脚本渲染的是一帧静态数据；"读数是否随手变化"属于轮询层。
+- **模式切换往返**：点「手势」按钮 → agent 换模型（~1s）→ 首帧匹配期间不应残留旧 overlay。
+
+
 
 

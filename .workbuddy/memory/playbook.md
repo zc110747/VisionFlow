@@ -335,3 +335,44 @@ ratio ⇒ **报文本身就够标定，不用改代码不用重编**。脚本
 **④ 真机 `ai_frame` 零回归的直接证据**：`camera01` 是 `ai_mode=ai-hand` 且 `hand` 非空（327 B）；
 历史相机 `testcam` 的 `ai_mode` 为 NULL、`hand` 列 **IS NULL** ⇒ detect/pose 帧从不写该列。
 
+### 7.7 P3 Web 端骨架 / HUD / 面板（2026-09-23 完成）
+
+**文件**：`web/src/ai/{skeleton,hand,draw}.ts`（新）、`web/src/components/{HandHud,HandPanel}.vue`（新）、
+`VideoPlayer.vue`（改）、`CameraView.vue`（改）、`client.ts`（改）。
+**验收**：`python scripts/verify_hand_overlay.py` → **PASS=41 FAIL=0**；`cd web && npm run check` → clean。
+
+**① 骨架画不出来的根因是"按点数硬编码 17"。** `o.keypoints.length === 17` 让 21 点的手部
+永远落不进分支 ⇒ ai-hand 在页面上是"**有方框、没有骨架**"（那个框来自 `objects[]` 里的
+`class="hand"` 记录，它一直都在）。拓扑现在是数据：`skeletonFor(count)`，**未知点数返回 null
+什么都不画**（硬套短数组会拉出孤立线，看着像跟踪错误，把排查引到错误的层）。
+
+**② hand 帧的骨架只画一次。** `ai_pipeline.cpp` 里 `o.keypoints = hs.landmarks`，所以
+`objects[0].keypoints` 与 `hand.landmarks` **同源**。overlay 只用 `hand.landmarks` 画，
+objects 循环对 hand 帧跳过骨架 —— 两处都画会叠成双层，像素级重合时看不出，
+一旦哪天只改了一处就会像"检测到两只手"。探针逐点比对（1e-6）钉住这条契约。
+
+**③ `delta` 在 `reference_initialized=false` 时必须不显示。** 此时它相对零原点 ⇒ 数值上等于
+绝对位置，显示出来就是"手一进画面飞了一大段"。HUD 显示 `—` + `REF LATCHING` → `REF LOCKED`。
+
+**④ `detected=false` 也要画 HUD**（显示 `NO HAND`），否则"手不在画面里"和"前端坏了"长得一样。
+
+**⑤ 前端 `AI_MODES` 是白名单**：`loadAIMode()` 用它过滤服务端下发的模式，
+漏登记 `ai-hand` ⇒ 按钮永不点亮、帧永不匹配（**静默**，不报错）。
+
+**⑥ 本轮新增的两道防线**（都可复用）：
+- `web/tools/check-sfc.mjs`（`npm run check`）：`tsc` 不读 `.vue`、esbuild 只转译 ⇒
+  `<script setup>` 是类型盲区，删 import 留引用会构建全绿、运行时白屏（本轮真实发生）。
+  它抽 script 块 + 补编译器宏声明 + 交 tsc + 行号映射回 `.vue`。
+- `scripts/verify_hand_overlay.py` + `scripts/hand_overlay_probe.mjs`：
+  esbuild 打包**前端自己的模块**、用**记录型 2D context** 断言绘制调用（条数 + 坐标是否被 clamp）、
+  Vite `ssrLoadModule` + `@vue/server-renderer` 渲染组件并扫 `undefined`/`NaN`。
+  **正样本锚点取自活 payload，且特意挑非 `UNKNOWN` 的手势帧**（`UNKNOWN` 会蒙混过关）。
+
+**⑦ 验前端用的"真机数据"优先从录制库取**：`ai_hand_log` 是 append-only + 原字节保真，
+`GET /hand/sessions/{i}` 就能拿到真机帧 —— 本次 1078 帧全部带 21 点，
+**不必为了验前端让人再举一次手**（1078 帧里有 1271 个坐标在画面外，也一并验到了）。
+
+**⑧ 部署的隐性前提**：`web/dist` 是**编译期** embed 进 exe 的 ⇒ 只 `npm run build` 不重编 exe，
+浏览器里还是旧 UI。`start.bat` 的重建判断曾漏掉这一点（只看 `web/src` vs `web/dist`），已补
+"dist 比 exe 新即 STALE"。**改 `.bat` 提醒**：括号块内的 `)` 会提前闭合分支，REM 里也不能有括号。
+

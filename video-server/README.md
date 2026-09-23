@@ -723,6 +723,33 @@ curl -s -X DELETE http://127.0.0.1:8081/api/cameras/camera01/hand/log
 
 未知摄像头返回**空快照**而非 404（`frame`/`status` 为 `null`），这样前端轮询不必区分"没数据"和"没这路"。
 
+### 10.9 Web 端手部骨架与 HUD（P3）
+
+在 `ai-hand` 模式下，视频上叠加 21 点骨架，左下角是受控的 HUD，右侧信息栏是完整的 `HAND 3D` 面板。
+
+**为什么不能只靠通用路径画出骨架**：overlay 原先用 `o.keypoints.length === 17` 决定画不画骨架，而手部是 21 点 —— 条件恒假，于是"有框没有骨架"。骨架拓扑现在是**数据**（`src/ai/skeleton.ts`：COCO 17 / MediaPipe HAND 21），`skeletonFor(count)` 按点数选表；**遇到不认识的点数返回 `null` 什么都不画**，而不是把连接表硬套到短数组上——那样会在画面里拉出几条孤立的线，看起来像跟踪错误，把排查引到错误的层。
+
+- **骨架只画一次**：agent 放进 `objects[]` 的那条 `class="hand"` 记录，其 `keypoints` 与 `hand.landmarks` 是**同一份**数据（`o.keypoints = hs.landmarks`）。hand 帧的骨架由 `hand.landmarks` 画，objects 循环跳过骨架 —— 两处都画会叠成双层，平时看不出来，一旦哪天两者不同步就会被读成"重复检测"。
+- **landmark 不 clamp，是刻意的**：与 agent 侧一致（同函数里 bbox clamp、点不 clamp）。手贴画面边缘时点确实在画面外，原样画出来让 canvas 裁掉才是真实信息；把它们拉回画面内会画出与手不符的骨架，然后被算到跟踪算法头上。
+- **HUD 用 HTML 层而不是 canvas 文字**：省掉 devicePixelRatio / `measureText` 那套，缩放时保持清晰，而且能在 Node 里 SSR 渲染做断言（见下）。
+- **`delta` 在 `reference_initialized=false` 时不显示**：此时参考点尚未锁定，delta 是"对着零原点"的差值，等于绝对位置，读起来就是一次巨大跳变。协议明文要求消费者在标志位为真前不得使用它，所以 HUD 显示 `—` 并标注 `REF LATCHING`，锁定后转 `REF LOCKED`。
+- **`detected=false` 时 HUD 照画**：显示 `NO HAND`。否则"手没在画面里"和"前端坏了"在屏幕上长得一模一样。
+- **`AIMode` 增 `ai-hand` 不是可选步骤**：`AI_MODES` 同时是 `loadAIMode()` 的白名单，服务端下发而这里没登记的模式会被**静默忽略**（按钮永不点亮、帧永不匹配）。
+
+```bash
+# 无浏览器验收（真模块 + 活 payload + 录制库里的真实手部帧）
+python scripts/verify_hand_overlay.py          # -> PASS=41 FAIL=0
+
+# 组件脚本块的类型检查（tsc 不读 .vue，vite 只转译）
+cd web && npm run check                        # -> SFC-CHECK: clean
+```
+
+`verify_hand_overlay.py` 覆盖：活服务 hand 块的字段存在性、`objects[0]` 与 `hand.landmarks` 的同源契约、用记录型 2D context 断言绘制调用（21 条骨 / 27 个关节点 / 每个 landmark 都画在"原值×缩放"的精确位置，即未被 clamp / 越界点原样传出）、`buildHandHud` 对每帧真数据无 `NaN`、以及 `HandHud`/`HandPanel` 的 SSR 渲染（含空态与正样本）。
+
+**它覆盖不到的**：canvas 实际像素、WebRTC 视频层、200 ms 轮询、模式切换往返 —— 这些必须真浏览器 + 真手，脚本结尾会打印这份清单。
+
+实现落点：`web/src/ai/{skeleton,hand,draw}.ts`、`web/src/components/{VideoPlayer,HandHud,HandPanel}.vue`。
+
 ---
 
 ## 11. 调试与排错
