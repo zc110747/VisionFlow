@@ -750,6 +750,57 @@ cd web && npm run check                        # -> SFC-CHECK: clean
 
 实现落点：`web/src/ai/{skeleton,hand,draw}.ts`、`web/src/components/{VideoPlayer,HandHud,HandPanel}.vue`。
 
+### 10.10 手部端到端验收与「三轴塌缩」结论（P4）
+
+**先说一条会改变用法的结论**：本机挂载下 `position` 的三个轴**只有 2 个是独立的**。
+`hand_map_coordinates()` 的 `x`/`z`/`y` 全部由**同一个检测框**导出（中心横、中心纵、`√(宽×高)`），
+一个 4 自由度矩形压成 3 个输出，天生不独立；实测**两次独立录制**一致：
+
+| 录制 | 帧数 | `corr(position.Y, position.Z)` | PC1+PC2 |
+|---|---|---|---|
+| run1 | 1160 | **+0.837** | **94.7%** |
+| 会话 51 | 288 | **+0.717** | **92.2%** |
+
+原因是**摄像头倾斜**：手抬高时它同时离镜头更近，"上举"与"前进"是同一个物理动作。
+换成**只用关键点**的尺度代理（刚性骨长）R² 只从 0.70 降到 0.54~0.61 ——
+**约 15%，说明耦合主体是透视，不是检测框**，改公式或改 `depth_source` 都修不了。
+
+⇒ **`X`/`Z` 可靠；`Y`（`F/B` 前进后退标签）在本挂载下不可靠。`invert_*` 保持全 `false` 并标注"未定案"。**
+⇒ 唯一能从根上解决的办法是**机械调整摄像头朝向**，让光轴垂直于手的运动平面；
+验收判据是重跑 `verify_hand_axis_coupling.py`，`corr(Y,Z)` 应显著低于 0.60。
+完整推导、同对比勘误与排除过程见架构文档 **`docs/prompter/hand-3d-phase1-architecture.md` §15**。
+
+```bash
+# 全链路端到端（无手时相关层给 SKIP 并 exit 2；--require-hand 才转 FAIL）
+python scripts/verify_hand.py                    # -> PASS=42 FAIL=0 SKIP=2
+python scripts/verify_hand.py --fast             # 跳过分段/状态机层
+
+# 三轴独立性（spec §16 的判据脚本；--file 可离线复跑，--gate 在耦合消失时返回 1）
+python scripts/verify_hand_axis_coupling.py --session 51 --gate
+
+# 从录制数据离线算各轴符号，并直接吐出 invert_* 取值（--self-test 不需真手）
+python scripts/verify_hand_direction.py --self-test      # -> SELF TEST PASS
+python scripts/verify_hand_direction.py --all --expect X+,Z+,Y+,Y-
+
+# 部署一致性：跑着的二进制到底在服务哪份 UI（比 sha256，不是比文件名）
+python scripts/verify_web_deploy.py              # -> PASS=12 FAIL=0
+
+# 真机像素验收（一键，需举手；脚本会等手，超时干净退出）
+scripts/verify_hand_overlay_live.bat
+```
+
+两条**只在真实数据里才发现**的接口事实，写前端和写脚本都要按它来：
+
+- `/api/cameras/{id}/hand/sessions/{idx}` 导出的行**只有 `hand` 块** ——
+  **没有 `objects`，也没有 `video_width/height`**（只有实时 `/metadata` 才有）。
+  ⇒ `position` 的那个框**无法从归档反算**；但 21 个关键点都在，纯几何分析可行。
+- `hand.detected = false` 时 **`position = [0,0,0]`**。
+  ⇒ 必须按 `detected` 门控，否则手一离开画面就会被读成"一次巨大位移"。
+
+另外要注意 **agent 侧没有 `AIMode::Off`**：`ai-off` 的语义是"web 停止绘制、agent 保留自己的模型
+且不回 notify"，所以切成 `ai-off` 后 `frame.ai_mode` 会**继续报 `ai-hand`** —— 这是设计，不是 bug
+（`verify_hand.py` 的 [G] 层就是钉这个语义的）。
+
 ---
 
 ## 11. 调试与排错
