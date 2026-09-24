@@ -161,11 +161,17 @@ def find_rest_start(frames, settle_n, return_band):
     return 0
 
 
-def segment(frames, min_excursion, return_band, settle_ms):
+def segment(frames, min_excursion, return_band, settle_ms, jump_band=0.2):
     """Anchor-and-peak segmentation. Returns (motions, frames_skipped).
 
     Each motion carries the neutral pose it started from and the furthest pose
     it reached.
+
+    `jump_band` guards the join between concatenated sessions: when the hand
+    leaves the frame and comes back it reappears somewhere else, and that
+    discontinuity would otherwise be measured as one enormous motion. A step
+    larger than the band is treated as a re-entry - the open motion is closed at
+    the peak it actually reached, and the anchor restarts from the new pose.
 
     The anchor is the RESTING pose, and it re-centres ONLY when the hand has
     been within `return_band` of it for `settle_ms`, by snapping onto that pose.
@@ -202,9 +208,20 @@ def segment(frames, min_excursion, return_band, settle_ms):
     motions = []
     cur = None
     settled = 0
+    prev = frames[0]["pos"]
 
     for f in frames:
         pos = f["pos"]
+        if maxabs(sub(pos, prev)) > jump_band:
+            # The hand left the frame and reappeared elsewhere.
+            if cur is not None:
+                motions.append(cur)
+                cur = None
+            anchor = list(pos)
+            settled = 0
+            prev = pos
+            continue
+        prev = pos
         if cur is None:
             exc = maxabs(sub(pos, anchor))
             if exc >= min_excursion:
@@ -455,6 +472,11 @@ def main():
                     help="must match the gap the session list was split with")
     ap.add_argument("--session", type=int, default=0,
                     help="session index; 0 = the most recent one")
+    ap.add_argument("--all", action="store_true",
+                    help="concatenate EVERY session instead of one. Use this when "
+                         "the motions may be split by a lost hand: a session "
+                         "boundary is not a pause, and analysing only the last "
+                         "one would silently drop the earlier motions")
     ap.add_argument("--file", default="",
                     help="read an exported hand_session_*.json instead of the API")
     ap.add_argument("--list", action="store_true", help="list sessions and stop")
@@ -492,19 +514,44 @@ def main():
                 print(f"  idx {s['index']:<5} frames {s['frame_count']:<6} "
                       f"detected {s['detected_count']:<6} gestures={s['gestures']}")
             return 0
-        if args.session > 0:
-            idx = args.session
+        lst = get_json(f"{base}/api/cameras/{cam}/hand/sessions?gap_ms={args.gap_ms}")
+        sess = lst.get("sessions") or []
+        if not sess:
+            print("no recorded sessions - record one with a hand in view")
+            return 1
+        if args.all:
+            # A session boundary marks where the hand left the frame, which is
+            # NOT the same as the operator pausing. Concatenating in index order
+            # keeps the recording whole; the segmentation then treats the join
+            # as a re-entry (see `jump_band`).
+            #
+            # Bounded on purpose: --all means "one export call per session", so
+            # on an accumulated log it is hundreds of round trips over large
+            # payloads. Clear the recorder first (DELETE .../hand/log) so the
+            # run owns the whole log, and the count is a handful.
+            if len(sess) > 200:
+                print(f"--all would fetch {len(sess)} sessions, which is an "
+                      "accumulated log rather than one experiment.\n"
+                      "Clear the recorder first (DELETE /api/cameras/<cam>/hand/log) "
+                      "so the run owns the log, or use --session <index>.")
+                return 2
+            frames_acc = []
+            for s in sess:
+                d = get_json(f"{base}/api/cameras/{cam}/hand/sessions/{s['index']}"
+                             f"?gap_ms={args.gap_ms}")
+                frames_acc.extend(d.get("frames") or [])
+            doc = {"frames": frames_acc}
+            print(f"source: live API, ALL {len(sess)} session(s) concatenated "
+                  f"({len(frames_acc)} rows)")
         else:
-            lst = get_json(f"{base}/api/cameras/{cam}/hand/sessions?gap_ms={args.gap_ms}")
-            sess = lst.get("sessions") or []
-            if not sess:
-                print("no recorded sessions - record one with a hand in view")
-                return 1
-            idx = max(s["index"] for s in sess)
-            print(f"no --session given, using the most recent one ({idx})")
-        doc = get_json(f"{base}/api/cameras/{cam}/hand/sessions/{idx}"
-                       f"?gap_ms={args.gap_ms}")
-        print(f"source: live API, session {idx}")
+            if args.session > 0:
+                idx = args.session
+            else:
+                idx = max(s["index"] for s in sess)
+                print(f"no --session given, using the most recent one ({idx})")
+            doc = get_json(f"{base}/api/cameras/{cam}/hand/sessions/{idx}"
+                           f"?gap_ms={args.gap_ms}")
+            print(f"source: live API, session {idx}")
 
     # ---- the expected sequence ----
     expect = []
