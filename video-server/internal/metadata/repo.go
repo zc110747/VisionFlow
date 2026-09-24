@@ -582,7 +582,7 @@ func (r *Repository) GetAIMode(cameraID string) (string, error) {
 // DB can never hold a mode the agent poller does not understand.
 func (r *Repository) SetAIMode(cameraID, mode string) error {
 	if !ValidAIMode(mode) {
-		return fmt.Errorf("invalid ai mode %q (want ai-off|ai-y|ai-y-pose)", mode)
+		return fmt.Errorf("invalid ai mode %q (want %s)", mode, AIModeList())
 	}
 	return dbutil.RetryOnBusy(3, func() error {
 		if _, err := r.db.Exec(`

@@ -17,6 +17,7 @@ package metadata
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"video-server/internal/logger"
@@ -47,6 +48,13 @@ const (
 // DefaultAIMode is reported by GET /aimode before any choice is made.
 const DefaultAIMode = AIModeDetect
 
+// AIModes is every mode the server accepts, in the order a rejection message
+// should name them. It is the single source behind both ValidAIMode and
+// AIModeList: the message used to be a hand-written literal and went stale the
+// moment AIModeHand was added, so an API client that read the 400 concluded
+// ai-hand was not a real mode.
+var AIModes = []string{AIModeOff, AIModeDetect, AIModePose, AIModeHand}
+
 // ValidAIMode reports whether s is one of the supported modes.
 //
 // This is the ONLY place the server decides which AI modes exist. The agent
@@ -54,12 +62,16 @@ const DefaultAIMode = AIModeDetect
 // unknown ones (keeping its current model) rather than guessing a nearest
 // match - so a mode added here but not there is inert, never harmful.
 func ValidAIMode(s string) bool {
-	switch s {
-	case AIModeOff, AIModeDetect, AIModePose, AIModeHand:
-		return true
+	for _, m := range AIModes {
+		if m == s {
+			return true
+		}
 	}
 	return false
 }
+
+// AIModeList renders the supported modes for an error message.
+func AIModeList() string { return strings.Join(AIModes, "|") }
 
 // Gesture tokens, mirroring carmera-agent's to_string(Gesture) verbatim.
 //
