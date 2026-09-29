@@ -875,4 +875,105 @@ LIVE 软边界实测 `sent 8, rejected 1, x travelled 29.25mm`。
 4. **`.ps1` 重定向产出的日志常是 UTF-16LE** ⇒ `grep` 读出来是空的/带空格。
    用 `iconv -f UTF-16LE -t UTF-8` 或直接 `tail -c 500`。
 
+---
+
+## §9 全新 clone 编译全挂：`go.mod` 从未被提交（2026-09-29）
+
+### 症状
+
+`cd video-server && go build ./...` 报：
+
+```
+pattern ./...: directory prefix . does not contain main module or its selected dependencies
+```
+
+**看起来**像 Go 环境/`GO111MODULE`/`GOPATH` 坏了。**实际**是仓库里根本没有
+`video-server/go.mod`。同一 checkouts 的其它强指纹：`go.sum` 明明在、目录里也有 `internal/` `cmd/`。
+
+### 根因
+
+仓库根 `.gitignore` 第 28 行有 `*.mod`（注释写 "Fortran module files"）。
+**它同时匹配 Go 的 `go.mod`**。而 `git add` 对**被忽略**的路径是**静默 no-op**：
+不报错、不警告、退出码 0。
+
+⇒ 结果是**一半提交**：`go.sum` 入了库、`go.mod` 从未入库。作者本机文件还在磁盘上
+（只是未跟踪）所以长期不暴露；本 checkout 是全新 clone（`.vscode/settings.json` 里还留着
+旧机器的 `D:/user_project/git/VisionFlow/...`），于是直接炸。
+
+### 三步定位（只读，10 秒定性）
+
+```bash
+git check-ignore -v video-server/go.mod    # 有输出 = 被忽略，并打印 "规则所在文件:行号:规则"
+git log --all --diff-filter=A --name-only -- '**/go.mod'   # 无输出 = 历史上从未 add 成功
+git status --ignored --short | grep '^!!'  # 还有哪些「现存但被忽略」的条目（再排除真构建产物）
+```
+
+判据区分：`fatal: pathspec ... did not match` = 文件真不存在；
+**零输出退出码 0** = 文件存在但被忽略（`git add` 也是这个行为，所以「我 add 过了」是幻觉）。
+
+### 修复
+
+| 文件 | 改动 |
+|---|---|
+| `.gitignore` | 删 `*.mod`，补显式 `!go.mod` 例外 + 注释「不要把它加回来」 |
+| `video-server/go.mod` | 新建：module `video-server` / `go 1.22` / `gopkg.in/yaml.v3 v3.0.1` / `modernc.org/sqlite v1.29.10` |
+| `video-server/go.sum` | `go mod tidy` 收敛（清掉 sqlite v1.57.0 / libc v1.74.4 等高版本残留，+31/−18） |
+| `.vscode/settings.json` | `cmake.sourceDirectory` 写死的 `D:/user_project/...` → `${workspaceFolder}/carmera-agent` |
+
+**重建版本怎么选**：先看本地模块缓存，用它里面已有的版本，离线也编得过 ——
+
+```bash
+ls "$(go env GOMODCACHE)/modernc.org/"          # -> libc@v1.49.3 mathutil@v1.6.0 memory@v1.8.0 sqlite@v1.29.10
+```
+
+`go mod tidy` **需要联网**：yaml.v3 的测试依赖 `gopkg.in/check.v1` 不在缓存里，
+`GOPROXY=off` 会报 `module lookup disabled by GOPROXY=off`。
+
+### 验收（真跑）
+
+| 项目 | 结果 |
+|---|---|
+| `go mod verify` | all modules verified |
+| `go build ./...` / `go vet ./...` | 0 error / 0 问题 |
+| `go test ./...` | **91 PASS / 0 FAIL**（62 顶层 + 29 子测试） |
+| agent `build-msvc.ps1 -Backend gstreamer` | **62/62 步 0 error**（MSVC 14.44.35207 / SDK 10.0.26100.0） |
+| `camera-agent-tests.exe` | **88/88** |
+| `verify_joint.py`（真机 UVC） | **PASS=19 FAIL=0**，真检出 `person ×2` |
+
+联调读数：agent `STREAMING` H264 1280×720；AI onnxruntime `models/yolo11n.onnx` 7.9 fps /
+infer 41 ms；metadata `sent=36 failed=0`；MediaMTX `camera01 online=true` inbound 7.7 MB；
+`/api/health` = `{"database":"ok","media_server":"ok","status":"ok"}`。
+
+### §9.1 本轮新增环境坑（通用）
+
+1. 🔴 **宿主 `http_proxy` 会污染本地验收**：环境里有 `HTTP_PROXY=http://127.0.0.1:53512`，
+   `curl http://127.0.0.1:8081/` 被劫持 → **502 `upstream connect failed`**，看着像服务端挂了。
+   修：`curl --noproxy '*'`；Python 脚本加 `NO_PROXY=127.0.0.1,localhost no_proxy=...`。
+   ⚠️ **Go 的 `net/http` 例外**：`ProxyFromEnvironment` 对 loopback 自动不走代理 ——
+   所以出现「server 轮询 MediaMTX :9997 正常，但 shell 侧 curl/浏览器打 8081 挂」，
+   先怀疑 shell 的代理变量，别去改服务端。
+2. **`cmd.exe` 在 Bash 与 PowerShell 工具里都被拦**（"bypasses all command validation" /
+   "cannot be used from the PowerShell tool"）⇒ **所有 `*.bat` 入口 agent 都跑不了**
+   （`start.bat` / `build_onelick.bat` / `build_oneclick.bat`）。按脚本内容手抄等价命令，
+   或走 `.ps1` 版（`scripts/build-msvc.ps1`）。
+3. **PowerShell 工具里给 native 命令加 `2>&1 | Tee-Object` 会把 CMake 的 stderr 进度升级成
+   `NativeCommandError` 终止错误**（脚本内部 `$ErrorActionPreference='Stop'`，CMake 的
+   `[1/9] Creating directories...` 走 stderr）⇒ 判为"构建失败"，其实只跑完 configure。
+   修：**构建脚本不加重定向直跑**，输出交给工具自己收。
+4. **`taskkill /F /IM x.exe` 在 Git Bash 里被路径转换**（`/F` → `F:/`，报 `无效参数/选项 - 'F:/'`）。
+   修：`MSYS_NO_PATHCONV=1 taskkill /F /IM x.exe`。
+5. **`go:embed all:dist` 的瞬时失败**：`vite build` 刚写完 `web/dist` 就立刻 `go build`，偶发
+   `cannot embed directory dist: contains no embeddable files`。**重试即过** —— 与 §8.7 的
+   `C1083` / `LNK1104` 同族（杀软/文件系统瞬时锁），别去改 `embed.go`。
+6. **agent 构建目录有两个名字**：`scripts\build-msvc.ps1 -Backend gstreamer` → **`build-msvc-gst`**；
+   `-Backend sim` 与 `build_oneclick.bat` → `build-msvc`。根 `start.bat` 两个都找、优先 `-gst`；
+   `video-server/build_onelick.bat` 只认 `build-msvc`（它自己会调 `build_oneclick.bat` 生成）。
+
+### §9.2 可复用沉淀
+
+同一模式已在全局 skill 库落地：**`git-silent-source-loss`**（`.gitignore` 通配误伤源文件 +
+`git add` 静默跳过；含类案清单：`*.mod`→`go.mod`、`Makefile`、`*.log`、`Build/`、`Drivers/`…）。
+**新增文件类型/目录前先探针**：`git check-ignore -v <新路径>/probe.txt`。
+
+
 
