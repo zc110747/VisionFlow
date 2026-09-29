@@ -158,3 +158,53 @@ detector and landmark model on a curled hand and confirm they find it at all
 (the tables above only prove the classifier separates a fist that was found).
 If one is added, add the hand region only, and record its licence and
 provenance here like `woman_hands.png` below.
+
+---
+
+## Synthetic sequence (`tools/make_synthetic_hand_sequence.py`)
+
+`woman_hands.png` is one still. To exercise the *pixel -> HandState -> arm*
+chain end to end, one still is not enough: that chain needs a hand that MOVES,
+and moving it by hand between captures cannot give a ground truth.
+
+`make_synthetic_hand_sequence.py` builds one. It crops the fixture's hand, then
+scales and translates it across a series of frames, and - crucially - it knows
+exactly where it put the hand, so it can emit the expected `HandState.position`
+per frame.
+
+```bash
+python tests/golden/tools/make_synthetic_hand_sequence.py \
+    --fixture tests/golden/woman_hands.png --models models \
+    --frames build-msvc/synth --expect build-msvc/synth/expected.json
+```
+
+Two things in it are worth knowing before editing it:
+
+**Ground truth is measured, not derived.** `place()` takes the ink extent of
+the pixels it just wrote and `expected_logical()` reproduces
+`hand_map_coordinates()` exactly. An algebraically nicer derivation drifts; the
+measured box does not. `measure_box_ratio()` must be calibrated in FIXTURE
+coordinates - comparing the model's box (fixture coords) against a cropped
+patch's ink (patch coords) invents a ~220 px offset out of nothing.
+
+**`settled` is a geometric property, not a fudge factor.** `HandAnalyzer`
+smooths with an EMA (`filter_alpha = 0.4`), so a moving frame reports a position
+still catching up. A frame is marked `settled` only when it and the two before
+it share a placement (see `SETTLE_RUN`), i.e. the hand really was held still
+long enough to converge. The C++ side asserts the strict tolerance on settled
+frames and a looser, lag-sized one on moving frames. Relaxing the single
+tolerance instead would hide a broken mapping behind the filter's lag.
+
+**The fist is injected, not composited.** A drawn fist scores 0 palms; a crop
+of the fixture's own palm is found by the palm model but rejected by the
+landmark model (confidence < 0.5). So `fist_inject_*` frames carry
+`"injected": true` and the C++ side feeds them the frozen landmark table
+instead of a PNG. The run is six frames long because
+`HandConfig::gesture_confirm_frames = 5` needs five consecutive frames before
+the gesture reaches `RobotLink` - one injected frame is absorbed as a candidate
+and never arrives.
+
+`tests/finished/orient2/f_00..f_39.png` are 40 real captures (1280x720) used by
+`robot_realframe_tests.cpp`. They have no ground truth, so that test asserts
+**robustness** (well-formed states, the pre-reference zero-delta invariant, no
+transport faults) rather than accuracy.

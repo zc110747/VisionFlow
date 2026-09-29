@@ -18,6 +18,11 @@ set(SOURCES
   metadata/metadata_encoder.cpp
   metadata/metadata_manager.cpp
   metadata/http_transport_winhttp.cpp
+  # Robot control branch (Phase 2): HandState -> MeArmPilot TCP JSON Lines.
+  # Compiles with or without ORT so the mapping/rate logic still builds and can
+  # be unit tested on a machine with no models.
+  robot/json_line_client_tcp.cpp
+  robot/robot_link.cpp
 )
 
 if(CAMERA_AGENT_BACKEND STREQUAL "gstreamer")
@@ -49,8 +54,9 @@ endif()
 target_link_libraries(camera-agent PRIVATE spdlog::spdlog)
 
 # Metadata transport: WinHTTP is an OS component, so there is nothing to install.
+# ws2_32 is needed by the robot branch's raw TCP socket (Winsock).
 if(WIN32)
-  target_link_libraries(camera-agent PRIVATE winhttp)
+  target_link_libraries(camera-agent PRIVATE winhttp ws2_32)
 endif()
 
 if(HAVE_ORT)

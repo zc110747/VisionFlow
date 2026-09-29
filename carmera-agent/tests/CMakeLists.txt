@@ -14,6 +14,10 @@ set(TEST_SOURCES
   hand_analyzer_tests.cpp
   hand_detector_tests.cpp
   hand_wiring_tests.cpp
+  robot_link_tests.cpp
+  robot_synthetic_tests.cpp
+  robot_realframe_tests.cpp
+  robot_live_tests.cpp
 )
 
 # Reuse the SIM backend sources from the app (deterministic, headless).
@@ -38,6 +42,10 @@ set(APP_SIM_SOURCES
   ${PROJECT_SOURCE_DIR}/src/metadata/metadata_encoder.cpp
   ${PROJECT_SOURCE_DIR}/src/metadata/metadata_manager.cpp
   ${PROJECT_SOURCE_DIR}/src/metadata/http_transport_winhttp.cpp
+  # Robot branch: stream_controller owns a RobotLink, so it must link. The tests
+  # substitute a scripted transport, so no MeArmPilot backend is required.
+  ${PROJECT_SOURCE_DIR}/src/robot/json_line_client_tcp.cpp
+  ${PROJECT_SOURCE_DIR}/src/robot/robot_link.cpp
 )
 
 add_executable(camera-agent-tests ${TEST_SOURCES} ${APP_SIM_SOURCES})
@@ -51,7 +59,7 @@ else()
 endif()
 target_link_libraries(camera-agent-tests PRIVATE spdlog::spdlog)
 if(WIN32)
-  target_link_libraries(camera-agent-tests PRIVATE winhttp)
+  target_link_libraries(camera-agent-tests PRIVATE winhttp ws2_32)
 endif()
 
 # The AI detector tests need ONNX Runtime (if installed) and the stb_image

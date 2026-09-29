@@ -117,8 +117,10 @@ bool StreamController::start() {
     }
 
     // Metadata first: the AI result callback pushes into it, so it must already
-    // be up when the first inference completes.
+    // be up when the first inference completes. The robot branch is fed from the
+    // same callback and follows the same rule.
     start_metadata();
+    start_robot();
     start_ai();
 
     running_ = true;
@@ -153,9 +155,48 @@ void StreamController::start_ai() {
         last_ai_frame_id_.store(r.frame_id);
         last_ai_ts_.store(r.timestamp);
         if (meta_.is_running()) meta_.push_result(r);
+        // Robot control taps the same result. It is gated on the AI mode the
+        // frame was produced in: only Hand frames carry a HandState, and the
+        // web UI selects that mode. So "the operator switched the interface to
+        // gesture recognition" IS the on/off switch - no second control needed,
+        // and switching away stops the commands on the very next frame.
+        //
+        // push_hand() only copies and enqueues (bounded, drops oldest), so a
+        // dead or slow robot backend cannot stall inference, let alone video.
+        if (robot_.is_running() && r.hand.has_value()) {
+            robot_.push_hand(*r.hand);
+        }
     });
     ai_.start();
     start_aimode_poller();
+}
+
+void StreamController::start_robot() {
+    if (!cfg_.robot.enable) {
+        // Say so out loud. This used to be a silent return, and "the operator
+        // moved their hand, the arm did not move, and the log said nothing" is
+        // indistinguishable from a broken link. One INFO line makes the
+        // difference between "not enabled" and "enabled but failing" obvious.
+        CA_LOG_INFO("[ROBOT] disabled (robot.enable=false, no --robot) - "
+                    "gesture control is off");
+        return;
+    }
+    if (!cfg_.ai.enable) {
+        // Not an error worth failing on: gesture control is meaningless without
+        // the AI branch, but the operator may still be mid-configuration.
+        CA_LOG_WARN("[ROBOT] robot.enable is true but ai.enable is false - "
+                    "gesture control needs the AI branch; branch not started");
+        return;
+    }
+
+    // Same contract as start_ai()/start_metadata(): any problem here is logged
+    // and swallowed. init() never connects, so a backend that is not running
+    // cannot delay startup, and the worker reconnects on its own schedule.
+    if (!robot_.init(cfg_.robot)) {
+        CA_LOG_WARN("[ROBOT] not started; video and AI are unaffected");
+        return;
+    }
+    robot_.start();
 }
 
 void StreamController::start_aimode_poller() {
@@ -269,6 +310,10 @@ void StreamController::stop() {
     running_ = false;
     ai_.stop();
     meta_.stop();
+    // Robot branch: stopped right after its producer (the AI thread) is gone so
+    // no push_hand() can race the shutdown. Like the other two it owns a thread
+    // and a bounded queue, and a stuck socket is bounded by timeout_ms.
+    robot_.stop();
     if (reconnect_thread_.joinable())
         reconnect_thread_.join();
     if (aimode_thread_.joinable())

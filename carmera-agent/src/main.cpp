@@ -85,6 +85,21 @@ static void print_help() {
         "  --metadata-log-payload Dump full JSON at debug level\n"
         "  --metadata-insecure    Relax TLS cert check (self-signed dev server ONLY)\n"
         "\n"
+        "Robot options (gesture -> MeArmPilot over TCP; off by default):\n"
+        "  --robot                Enable robot control (needs --ai --ai-mode hand)\n"
+        "  --no-robot             Disable robot control\n"
+        "  --robot-host <host>    MeArmPilot host (default 127.0.0.1)\n"
+        "  --robot-port <n>       MeArmPilot TCP port (default 9100)\n"
+        "  --robot-map <mode>     delta | absolute (default delta)\n"
+        "  --robot-rate <hz>      Client-side send limit, 1..60 (default 15)\n"
+        "  --robot-gain-x|-y|-z <f>  Normalised->mm gain, delta mode only\n"
+        "  --robot-deadzone-mm <f>   Skip commands below this (default 0.5)\n"
+        "  --robot-gesture-home <g>  open_palm | fist | off (default open_palm)\n"
+        "  --robot-no-gripper     Do not bind the fist to the gripper\n"
+        "  --robot-no-home-return Keep the pose when the hand leaves the frame\n"
+        "  --robot-timeout <ms>   Per-command socket timeout (default 2000)\n"
+        "  --robot-reconnect <ms> Reconnect delay (default 2000)\n"
+        "\n"
         "  --version          Show version\n"
         "  --help             Show this help\n";
 }
@@ -154,6 +169,14 @@ int main(int argc, char** argv) {
         bool md_timeout=false, md_hb=false, md_log_payload=false, md_insecure=false;
         int  md_queue_v=0, md_timeout_v=0, md_hb_v=0;
         std::string md_url_v, md_cam_v;
+        // Robot control overrides (gesture -> MeArmPilot)
+        bool rb=false, rb_no=false, rb_host=false, rb_port=false, rb_map=false;
+        bool rb_rate=false, rb_gain_x=false, rb_gain_y=false, rb_gain_z=false;
+        bool rb_deadzone=false, rb_gesture_home=false, rb_no_gripper=false;
+        bool rb_no_home_return=false, rb_timeout=false, rb_reconnect=false;
+        int  rb_port_v=0, rb_rate_v=0, rb_timeout_v=0, rb_reconnect_v=0;
+        float rb_gain_x_v=0.0f, rb_gain_y_v=0.0f, rb_gain_z_v=0.0f, rb_deadzone_v=0.0f;
+        std::string rb_host_v, rb_map_v, rb_gesture_home_v;
     } cli;
 
     auto get_val = [&](int i, const char* opt) -> std::string {
@@ -223,6 +246,32 @@ int main(int argc, char** argv) {
                                               cli.md_timeout_v = std::atoi(get_val(i++, "--metadata-timeout").c_str()); }
         else if (a == "--metadata-heartbeat") { cli.md_hb = true;
                                                 cli.md_hb_v = std::atoi(get_val(i++, "--metadata-heartbeat").c_str()); }
+        else if (a == "--robot")               cli.rb = true;
+        else if (a == "--no-robot")            cli.rb_no = true;
+        else if (a == "--robot-no-gripper")    cli.rb_no_gripper = true;
+        else if (a == "--robot-no-home-return") cli.rb_no_home_return = true;
+        else if (a == "--robot-host") { cli.rb_host = true;
+                                        cli.rb_host_v = get_val(i++, "--robot-host"); }
+        else if (a == "--robot-port") { cli.rb_port = true;
+                                        cli.rb_port_v = std::atoi(get_val(i++, "--robot-port").c_str()); }
+        else if (a == "--robot-map")  { cli.rb_map = true;
+                                        cli.rb_map_v = get_val(i++, "--robot-map"); }
+        else if (a == "--robot-rate") { cli.rb_rate = true;
+                                        cli.rb_rate_v = std::atoi(get_val(i++, "--robot-rate").c_str()); }
+        else if (a == "--robot-gain-x") { cli.rb_gain_x = true;
+                                          cli.rb_gain_x_v = (float)std::atof(get_val(i++, "--robot-gain-x").c_str()); }
+        else if (a == "--robot-gain-y") { cli.rb_gain_y = true;
+                                          cli.rb_gain_y_v = (float)std::atof(get_val(i++, "--robot-gain-y").c_str()); }
+        else if (a == "--robot-gain-z") { cli.rb_gain_z = true;
+                                          cli.rb_gain_z_v = (float)std::atof(get_val(i++, "--robot-gain-z").c_str()); }
+        else if (a == "--robot-deadzone-mm") { cli.rb_deadzone = true;
+                                               cli.rb_deadzone_v = (float)std::atof(get_val(i++, "--robot-deadzone-mm").c_str()); }
+        else if (a == "--robot-gesture-home") { cli.rb_gesture_home = true;
+                                                cli.rb_gesture_home_v = get_val(i++, "--robot-gesture-home"); }
+        else if (a == "--robot-timeout") { cli.rb_timeout = true;
+                                           cli.rb_timeout_v = std::atoi(get_val(i++, "--robot-timeout").c_str()); }
+        else if (a == "--robot-reconnect") { cli.rb_reconnect = true;
+                                             cli.rb_reconnect_v = std::atoi(get_val(i++, "--robot-reconnect").c_str()); }
         else if (a == "--ai-input") {
             if (i + 2 >= argc) { CA_LOG_ERROR("Missing value for --ai-input <w> <h>"); }
             else { cli.ai_w = cli.ai_h = true;
@@ -304,6 +353,49 @@ int main(int argc, char** argv) {
     if (cli.md_hb)           cfg.metadata.heartbeat_interval_sec = cli.md_hb_v;
     if (cli.md_log_payload)  cfg.metadata.log_payload  = true;
     if (cli.md_insecure)     cfg.metadata.skip_tls_verify = true;
+
+    // ---- robot branch (CLI > YAML > default) ------------------------------
+    if (cli.rb)              cfg.robot.enable = true;
+    if (cli.rb_no)           cfg.robot.enable = false;
+    if (cli.rb_host)         cfg.robot.host   = cli.rb_host_v;
+    if (cli.rb_port)         cfg.robot.port   = cli.rb_port_v;
+    if (cli.rb_rate)         cfg.robot.rate_hz = cli.rb_rate_v;
+    if (cli.rb_gain_x)       cfg.robot.gain_x = cli.rb_gain_x_v;
+    if (cli.rb_gain_y)       cfg.robot.gain_y = cli.rb_gain_y_v;
+    if (cli.rb_gain_z)       cfg.robot.gain_z = cli.rb_gain_z_v;
+    if (cli.rb_deadzone)     cfg.robot.deadzone_mm = cli.rb_deadzone_v;
+    if (cli.rb_timeout)      cfg.robot.timeout_ms = cli.rb_timeout_v;
+    if (cli.rb_reconnect)    cfg.robot.reconnect_ms = cli.rb_reconnect_v;
+    if (cli.rb_no_gripper)   cfg.robot.gesture_gripper = false;
+    if (cli.rb_no_home_return) cfg.robot.home_on_presence = false;
+    if (cli.rb_map) {
+        // Closed vocabulary. Unlike the YAML path (which warns and keeps the
+        // default), a bad value typed on the command line is a hard error: the
+        // operator asked for it in this very command.
+        if (cli.rb_map_v != "delta" && cli.rb_map_v != "absolute") {
+            CA_LOG_ERROR("Unknown --robot-map '{}' (expected delta | absolute)",
+                         cli.rb_map_v);
+            return 2;
+        }
+        cfg.robot.map_mode = cli.rb_map_v;
+    }
+    if (cli.rb_gesture_home) {
+        if (cli.rb_gesture_home_v != "open_palm" &&
+            cli.rb_gesture_home_v != "fist" &&
+            cli.rb_gesture_home_v != "off") {
+            CA_LOG_ERROR("Unknown --robot-gesture-home '{}' (expected open_palm | fist | off)",
+                         cli.rb_gesture_home_v);
+            return 2;
+        }
+        cfg.robot.gesture_home = cli.rb_gesture_home_v;
+    }
+    if (cfg.robot.enable && !cfg.ai.enable) {
+        // Fail loudly but not fatally: this combination can only be a mistake,
+        // and silently starting a branch that can never receive a HandState
+        // would look like "gesture control is broken".
+        CA_LOG_WARN("[ROBOT] --robot needs --ai (with --ai-mode hand): "
+                    "no HandState will ever be produced; branch stays idle");
+    }
     const double duration = cli.dur ? cli.duration_v : 0.0;
 
     ca::log::set_level(cfg.log_level);

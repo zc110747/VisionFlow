@@ -115,6 +115,39 @@ $env:PATH = @(
     $env:PATH
 ) -join ';'
 
+# ---- spdlog source pin ----------------------------------------------------
+# FetchContent would clone spdlog from GitHub and then run `git submodule
+# update`. On a machine whose PATH puts a broken MSYS2 git first (observed:
+# `git-sh-setup: file not found`), that submodule step fails and the WHOLE
+# configure dies with "Failed to update submodules" - even though spdlog's
+# sources are already sitting in the build tree from an earlier configure. The
+# failure only appears after the build dir has been wiped (e.g. -Clean), because
+# otherwise FetchContent's stamp files short-circuit the step.
+#
+# Pinning FETCHCONTENT_SOURCE_DIR_<NAME> makes FetchContent use the given
+# directory verbatim and skip clone/submodule entirely, so the build depends on
+# neither the network nor the host's git. Search order, first hit wins:
+#   1. <repo>/.third_party/spdlog-src        optional pristine vendored copy
+#   2. an existing  <build>*/_deps/spdlog-src   reuse an earlier download
+#   3. nothing -> FetchContent clones (needs a working git + network)
+$spdlogCandidates = @(
+    (Join-Path (Split-Path -Parent $Root) '.third_party\spdlog-src'),
+    (Join-Path $Root 'build-msvc-gst\_deps\spdlog-src'),
+    (Join-Path $Root 'build-msvc\_deps\spdlog-src')
+)
+$spdlogSrc = $null
+foreach ($cand in $spdlogCandidates) {
+    if (Test-Path (Join-Path $cand 'CMakeLists.txt')) { $spdlogSrc = $cand; break }
+}
+$spdlogArgs = @()
+if ($spdlogSrc) {
+    $spdlogArgs = @("-DFETCHCONTENT_SOURCE_DIR_SPDLOG=$($spdlogSrc -replace '\\','/')")
+    "spdlog : pinned to $spdlogSrc"
+} else {
+    "spdlog : no local copy found - FetchContent will clone from GitHub"
+    "         (if configure fails on 'Failed to update submodules', the host git is broken)"
+}
+
 # ---- Configure + build ----------------------------------------------------
 $Build = Join-Path $Root $BuildDir
 if ($Clean -and (Test-Path $Build)) { Remove-Item -Recurse -Force $Build }
@@ -126,7 +159,7 @@ $cmakeArgs = @(
     "-DCMAKE_BUILD_TYPE=Release",
     "-DCMAKE_CXX_COMPILER=$Cl",
     "-DCAMERA_AGENT_BACKEND=$Backend"
-)
+) + $spdlogArgs
 
 "--- configure ---"
 & cmake @cmakeArgs

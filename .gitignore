@@ -44,6 +44,10 @@ build/
 Build/
 build-*/
 
+# Locally vendored third-party sources used to pin FetchContent (see
+# carmera-agent/scripts/build-msvc.ps1). Machine-local, never committed.
+.third_party/
+
 # CMake generated files
 CMakeFiles/
 CMakeCache.txt

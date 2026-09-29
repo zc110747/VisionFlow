@@ -95,3 +95,162 @@ metadata:
   log_payload: false            # dump full JSON at DEBUG level
   insecure: false               # https only: relax cert check for a self-signed DEV server. NEVER in production.
 
+# ---- Robot control (gesture -> MeArmPilot, TCP JSON Lines) -----------------
+# Optional, off by default, and only ever active while the AI branch is in Hand
+# mode ("ai-hand"). Requirements it is built around:
+#   * opt-in from the UI   - the switch is the AI mode itself; switching away
+#                            from hand mode stops the commands immediately.
+#   * never hurts video    - same contract as the AI/metadata branches: this
+#                            branch owns its own thread and bounded queue, and
+#                            an unreachable/slow/refusing backend only ever
+#                            produces WARN logs.
+#
+# The protocol and the接入 rules are owned by the MeArmPilot repo:
+#   docs/protocol/gesture-control.md   (how a visionflow client must behave)
+#   docs/protocol/tcp-xyz-v2.md        (movexyz / moveto / home / caps)
+# Nothing in this project may copy a bound, limit or angle out of those docs -
+# every constant is fetched from `caps` at connect time.
+robot:
+  # Master switch. It is still gated on the AI branch running in `hand` mode:
+  # only hand frames carry a HandState, and the web UI selects that mode. So
+  # "the operator switched the interface to gesture recognition" IS the on/off
+  # switch - this flag only decides whether the branch may exist at all.
+  #
+  # Default is ON because the joint runner (repo-root `start.bat`) passes
+  # --robot anyway. A backend that is not running is harmless: connect() is
+  # deferred to the worker thread, and every failure is a WARN, never a stall.
+  # Pass --no-robot (or set this to false) to opt out.
+  enable: true
+  host: 127.0.0.1
+  port: 9100                    # MeArmPilot TCP control interface
+  timeout_ms: 2000              # per-command socket timeout
+  reconnect_ms: 2000            # delay between reconnect attempts
+
+  # delta    : hand displacement -> movexyz. "hand left, arm left". Follows the
+  #            hand naturally and cannot be trapped by the fact that the inside
+  #            of the workspace box can still be unreachable.  <- default
+  # absolute : hand position -> moveto. "point and go", but an unreachable
+  #            target must keep the last good point instead of slamming.
+  map_mode: delta
+
+  # Client-side throttle. The server does NOT throttle (min_send_interval_ms is
+  # 0), so this is what keeps the command rate inside 10-20 Hz.
+  rate_hz: 15
+
+  # Normalised-unit -> mm gain, DELTA route only. The absolute route takes its
+  # scale from caps.workspace so no bound is ever duplicated here.
+  #
+  # The effective per-axis gain is `gain_axis * reach_span_axis / 0.5`, i.e. a
+  # hand sweeping half the frame moves the arm across its whole reachable span.
+  # These knobs scale that down. Below 1.0 the arm moves LESS than the hand
+  # ("hand big, arm small"), which is how hand-tracking jitter is kept out of
+  # the arm - a value of 0.25 means a normalised step of 0.10 moves the arm
+  # about a quarter of the way it used to.
+  #
+  # Tuned 2026-09-29 against live use, after the operator reported the 1:1-ish
+  # response was too jumpy to work with:
+  #
+  #   axis  span(mm)  gain   step at delta=0.02 (motion_deadzone)   at delta=0.10
+  #   X       39.0    0.25   0.39 mm  -> below 0.5 mm floor, filtered      1.95 mm
+  #   Y      176.0    0.50   1.76 mm  -> passes                             8.80 mm
+  #   Z       41.5    0.25   0.42 mm  -> below 0.5 mm floor, filtered      2.08 mm
+  #
+  # Two consequences worth knowing before raising them further:
+  #   1. X/Z now filter out hand tremor entirely (their 0.02-normalised jitter
+  #      lands under the 0.5 mm `deadzone_mm` / kMinDeltaMm floor). That is the
+  #      point - but it also means slow, deliberate small hand moves on those
+  #      axes do nothing. Raise the gain if the arm feels dead rather than calm.
+  #   2. Y is deliberately NOT 0.25. Its span is 4.5x X's, so the same gain made
+  #      it conspicuously slower than the other two axes. Keep the three axes'
+  #      mm-per-normalised-unit ratios in mind, not the raw gain numbers.
+  gain_x: 0.25
+  gain_y: 0.5
+  gain_z: 0.25
+
+  # Below this the command is skipped, not sent: an all-zero vector is a
+  # parameter error on the server, and hand tremor would otherwise emit a
+  # meaningless micro-move every single frame.
+  deadzone_mm: 0.5
+
+  # ---- soft boundary (delta route only) ------------------------------------
+  # In delta (follow-the-hand) mode the hand can keep travelling after the arm
+  # has reached the edge of its workspace, so every further step in that
+  # direction comes back JOINT_LIMIT until the hand returns. Measured live: a
+  # 20 s run gave rejected=83 against sent=12. The link stays healthy (nothing
+  # reconnects, the arm never jumps) but "my hand moves and the arm does not" is
+  # a poor experience.
+  #
+  # With this on, the per-axis gain is tapered as the arm nears that axis' bound,
+  # so it eases into the wall instead of grinding against it. The taper reads the
+  # arm's COMMANDED position, which is the only position available (the real arm
+  # has no feedback): exact on sim, approximate on hardware.
+  soft_boundary: true
+
+  # Fraction of each axis' span, from each end, over which the gain is tapered.
+  # 0.15 = the last 15% before a bound is a slow zone. Bigger feels weak
+  # everywhere, smaller is still a hard stop.
+  soft_margin: 0.15
+
+  # The tapered gain never reaches zero: at exactly 0 the arm could not be
+  # commanded back OUT of the margin (every step, either direction, would be
+  # scaled into the deadzone). This floor keeps a slow escape route.
+  soft_min_gain: 0.10
+
+  # ---- measured reach: the gain basis --------------------------------------
+  # caps.workspace is a BOUNDING BOX over the geometric reach, and it includes
+  # poses the IK cannot solve. On this backend it is 1.6-4.0x too wide, and HOME
+  # is not centred inside the real range - measured (2026-09-29, absolute moveto
+  # probes at the HOME height):
+  #
+  #   axis        caps box            reachable         span    HOME margin
+  #   X front     [40.46, 175.88]     [105.78, 144.78]  39.0 mm  -X 9 / +X 30
+  #   Y left      [-153.0, 153.0]     [-88.0, 88.0]    176.0 mm  centred
+  #   Z up        [49.08, 114.68]     [72.97, 114.47]   41.5 mm  -Z 36 / +Z 5
+  #
+  # Re-measure after any mechanical change:
+  #   python scripts/measure_reach.py            # prints this table + the YAML
+  #
+  # Deriving the gain from the box (X: 135.43/0.5 = 270.9) makes ONE frame of
+  # hand motion command 13-27 mm - several times the 9 mm the arm actually has
+  # left at HOME, and 5x the 5 mm it has in +Z. The first step is refused, and
+  # the taper measured against the same box still sees "60 mm of clearance" so
+  # it never dampens. Symptom: the hand moves and the arm does not.
+  #
+  # These are SPANS in mm (not bounds): the band is centred on the caps home
+  # pose, so re-fitting an arm only needs the span updated. Set 0 to fall back
+  # to the caps box for a device you have not measured.
+  reach_span_x: 39.0
+  reach_span_y: 176.0
+  reach_span_z: 41.5
+
+  # A refusal answers "too big", not "never": retry the same motion at half
+  # length before treating the direction as closed. Without it the first refusal
+  # at a wall latches the axis shut and the arm stops short of ground it could
+  # still cover (measured: -X has 5 mm of usable travel left at HOME, but the
+  # box-sized step asked for 13 mm).
+  soft_probe_on_reject: true
+  soft_probe_tries: 2          # 2 = the original attempt plus one halved retry
+
+  # Discrete gestures (edge triggered, from gesture-control.md §5):
+  #   open_palm -> home      (open hand = reset to the known pose)
+  #   fist      -> gripper close, a later open palm -> gripper open
+  #   off       -> that gesture is unbound
+  gesture_home: open_palm       # open_palm | fist | off
+  gesture_gripper: true
+
+  # A hand that leaves the frame and comes back returns HOME and re-establishes
+  # the basis, instead of continuing from a stale origin.
+  #
+  # lost_frames is measured against the AI inference rate, NOT the camera rate:
+  # the hand branch runs at ~8 Hz, so one frame is ~125 ms. The palm/landmark
+  # cascade drops a frame now and then on a real hand (measured: bursts of 1-2
+  # misses, ~0.25 s, while the hand never actually left), and a threshold of 3
+  # sat right on top of that - a flicker was enough to declare "the hand left",
+  # yank the arm HOME and break the follow. 6 frames (~0.75 s) rides out the
+  # measured flicker while still reacting to a genuine exit in well under a
+  # second. Raise it if your lighting is worse; lower it if HOME feels sluggish.
+  home_on_presence: true
+  lost_frames: 6                # frames of absence before "the hand left"
+
+  log_commands: true            # log every command result (raw protocol text)
+

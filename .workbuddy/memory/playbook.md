@@ -453,3 +453,346 @@ bbox 是**满画面高**（`[350,0,749,720]`，而 landmark 只占 y 186..697）
 **顺便：端口探活不要用 `netstat`。** `grep -E ":(8081|8554)\b"` 在此环境给出**假阴性**
 （服务 HTTP 200 却匹配不到）；换个写法又能匹配。判据直接打 HTTP 接口。
 
+---
+
+## §8 手势控臂 Phase 2（2026-09-29，四级验收全通）
+
+### 8.1 架构与边界（**这条是硬约束，不是风格**）
+
+```
+HandState -> RobotLink(映射/限速/边沿) -> IJsonLineClient -> TCP :9100 -> armpilot-backend
+```
+
+`hand_types.h` 原文："Phase 2 adds HandState -> RobotCommand in a **SEPARATE** project.
+Nothing here may know about a robot, IK, servos, MuJoCo or MeArmPilot."
+→ 依赖**单向**。新增代码全在 `carmera-agent/{include,src}/camera_agent/robot/`，
+`hand_types.h` / `IDetector` / `HandAnalyzer` / video / AI 路径**一行未改**。
+
+生效三条件（缺一不影响视频）：① Web UI 切 `ai-hand`；② 启动带 `--robot`；
+③ `:9100` 有后端。连不上只 **WARN**，`RobotLink` 自己退避重连（默认 2s），视频照推。
+
+### 8.2 七个非直观实现点（踩过才知道）
+
+1. **`update()` 返回值只有一个语义**："传输还能用吗"。被服务端拒绝（`JOINT_LIMIT`）
+   和低于死区跳过都是**正常协议结果**，仍返回 true。判"有东西发生"要写成
+   `sent增 + rejected增 == 1`，**不能只断 `sent > before`** —— `sent_` 只计被接受的。
+2. **`do_moveto` 记录的是"下发目标"，不是应答 `tcp`**。真机无位置反馈，应答 `tcp` 是
+   命令值，而 `home` 的应答是 home 位姿 → 拿应答当基准比对永远不成立，死区守卫失效会重复发。
+3. **`open()` 握手后必须清零会话计数**：`sent_=rejected_=skipped_=0`。
+   caps+home 是连接维护不是跟手流量，留在计数里会给测试一个恒定偏移。
+4. **首帧不算"重入"**：`presence_established_` 保证会话第一帧只记录不触发 HOME，
+   否则每次开会话都白跑一次 home（`open()` 刚发过）。
+5. **参考点未锁存必须直接 return**：`!hs.reference_initialized` 时 delta 是到画幅原点的
+   巨大位移，消费它会把手甩出去。这是防首帧幽灵位移的**不变式**，测试要单独钉。
+6. **增益不是拍脑袋**：`gesture-control.md §2.1` 推 `gain = workspace跨度 / 手有效行程`；
+   `axis_scale(lo,hi)=(hi-lo)/kHandActiveSpan`（0.5），`gain_x|y|z` 是乘数。
+   轴对应：手 `dy`→臂 `X`，手 `dx`→臂 `-Y`（**镜像**，左侧是 +y），手 `dz`→臂 `Z`。
+7. **`spdlog` 占位符是 `{}`，不是 `%.2f`/`%s`** —— 写 printf 风格会静默乱码。
+
+### 8.3 四级验收阶梯（`carmera-agent/scripts/verify_gesture_arm.py` 一键跑）
+
+| 级 | 验什么 | 测试 / 门槛 |
+|---|---|---|
+| L0 | 构建 | `scripts/build-msvc.ps1 -Backend sim`，0 warning / 0 error |
+| L1 | VisionFlow 指令直驱真 sim 臂 | `robot_live_backend_drives_sim_arm`，**`ARM_PILOT_LIVE=1` 才跑** |
+| L2a | 合成像素对**已知几何真值** | `robot_synthetic_*`（2 个） |
+| L2b | **真实帧**走同链路（无真值，断鲁棒性） | `robot_realframes_*`（2 个） |
+| L3 | 实时摄像头（**人工**） | 脚本会打印命令 |
+
+**L1 必须默认 skip**（靠 env 开启），否则 `ctest` 就不再是无依赖的。
+
+实测数据（可直接引用）：caps `protocol=2 ws=[40.4582,-153.012,49.0849]..[175.883,153.012,114.68]
+home tcp=[115.033,0,109.224]`；真实后端把大位移**拒绝**（坑 4 真发生）、
+极小位移**跳过**（坑 1 真发生）；真实帧检出率 **20/40**（手贴脸遮挡，数据性质）。
+
+### 8.4 合成序列的两个硬限制（别试图绕过）
+
+1. **拳头只能注入，不能画**。画出来的拳头掌心模型检出 **0 palms**；裁夹具自身掌心区过得了
+   掌心模型，但被 landmark 模型以 `conf < 0.5` 拒绝。两条路都得不到 `HandState`。
+   → `fist_inject_*` 帧标 `"injected": true`，C++ 侧喂**冻结的真实 landmark 表**。
+2. **去抖要求连续帧数**：`gesture_confirm_frames = 5` ⇒ 注入**至少 5 帧**，
+   1 帧会被当成候选吸收掉，`gripper` 计数永远是 0。
+
+### 8.5 EMA 与"settled"—— 判据不能偷懒
+
+`HandAnalyzer` 用 EMA（`filter_alpha=0.4`）平滑位置 ⇒ **运动帧报的位置还在追**。
+拿它和原始几何直接比，误差 0.0992 恰好卡在 0.10 容差线上（看起来"过了"，其实是在测滤波器滞后）。
+正解：生成器标 **`settled`**（本帧及前两帧 placement 完全相同 = 手静止了三帧、EMA 已收敛），
+测试对 settled 帧用严格容差、运动帧用"滞后量级"的宽松容差。放松单一容差会把映射 bug 藏进滞后里。
+
+### 8.6 生成器的坐标系陷阱
+
+`measure_box_ratio()` **必须在夹具坐标系标定**。拿模型框（夹具坐标）去比裁剪后 patch 的
+墨迹（patch 坐标）会凭空造出 ~220px 偏移。正解：`cut_hand()` 返回 `cut_rect`，
+在同一坐标系内标定（实测 offset ≈ (−0.2,−0.1) px，预测误差降到 0.029）。
+真值取"合成帧非黑像素范围"**直接量测**，不要做易漂移的代数推算。
+
+### 8.7 本机环境坑（本轮新增）
+
+- **`-Clean` 不可用**：宿主 fail-closed 安全包装拦 `Remove-Item -Recurse`，报
+  `[safe-delete][SAFE_DELETE_FAIL_CLOSED] trash-failed`，并把 `build-msvc` 删到只剩日志
+  （进程 exit 0，看起来像成功）。要干净重建就**先手工挪走目录**再做普通 build。
+- **托管 Python 3.13.12 没 cv2**；有 cv2 5.0.0 的是
+  `C:\Users\lx176\.workbuddy\binaries\python\envs\default\Scripts\python.exe`。
+- **PowerShell 工具吞构建输出**：`Tee-Object` 落 **UTF-16** 日志，读的时候按
+  `utf-16 → utf-8 → gbk` 依次试解码；`cmd /c "..."` 被安全策略拦（老坑）。
+- **🔥 MSVC/Ninja 偶发 `C1083 Permission denied` 但目标 obj 不存在 → 杀软瞬时锁，直接重试**。
+  症状：`xxx.cpp : fatal error C1083: 无法打开编译器生成的文件: "...\xxx.cpp.obj": Permission denied`，
+  构建停在中途，同批其余 obj 全部成功。**判据两步**：
+  ① `tasklist` 确认没有同名 exe 残留（排除真进程占用）；
+  ② `ls` 构建目录 —— **失败的那个 obj 根本不存在**（不是"有文件被锁"），即写入瞬间被拒。
+  **修法：原样重试一次**（通常只补编那 1 个目标 + 链接即过）。**不要一上来 `-Clean` 或删
+  build 目录** —— 本机 `-Clean` 本身还会因 fail-closed 安全包装把目录删残（见上一条）。
+
+### 8.8 L3 真机联调（2026-09-29 续，四级验收最后一格）
+
+**真机链路实测**（LRCP USB2.0 / 1280×720@30 / GStreamer 后端）：
+`--list` 枚举到 `Camera 0: LRCP USB2.0` → `Negotiated capture format: 1280x720 @ 30fps`
+→ `Status: STREAMING -> rtsp://127.0.0.1:8554/camera01` → `[HAND] ready` →
+`conf=0.92~0.98 hand=right` / `infer=~20ms` / `[AI] fps=8.0` →
+**真握拳 → `cmd=gripper action=close ok`**；增量跟手 `cmd=movexyz delta=[..] ok`。
+
+**三条硬结论：**
+
+1. **`lost_frames` 必须对着 AI 推理率算，不是相机帧率。** 手部支路 ~8Hz（一帧 ≈125ms），
+   实机检测抖动的形态是 **1–2 帧（≈0.25s）** 短促漏检。默认 `3`（≈0.375s）与它**临界**
+   ⇒ 20s 内误判 4 次「手离开」并强拉 HOME、打断跟随。提到 **6（≈0.75s）** 后同一场景
+   重入降到 0–1 次。**相机 30fps 会让人把阈值算成 1/4**，这是这个坑最阴的地方。
+2. **「持续被拒绝」是增量式的物理必然，不是 bug。** 手继续朝一个方向走而臂已抵边界，
+   之后每步吃 `JOINT_LIMIT`，直到手回退。实测一轮 20s `rejected=83 / sent=12`；
+   但 `update()` 仍返回 true、链路不断、臂不乱跳 ⇒ **保持 DEBUG 日志防刷屏**，
+   README 七坑表第 4 条已改写为"常态"。要绕开就换 `--robot-map absolute`。
+3. **`do_movexyz` 不消费 `last_good_mm_`。** 那个锁存只服务 `do_moveto`（绝对路线）——
+   delta 下发的是位移不是位置，没有可比对的绝对量。早期在成功分支写它是一次**死状态**
+   （已删）。另外 `movexyz` 成功日志原先在 `CA_LOG_DEBUG`，默认 `info` 起法**完全看不见
+   跟手在动** ⇒ 必须提到 `CA_LOG_INFO`，否则真机调试像"没反应"。
+
+**GStreamer 抓帧/探针两条坑：**
+- `gst-launch -e` + `multifilesink` **会挂住**：`-e` 等 EOS，而 `mfvideosrc` **不产 EOS**。
+  → 去掉 `-e`，用 `num-buffers=N` 自然结束。
+- `--source` 必须是 **`mfvideosrc`**，不是 `dshowvideosrc`（这台走 MediaFoundation）。
+  探针命令 `videoconvert` 到 RGB 抓帧会发青/发品红（色彩矩阵元数据丢失），
+  但 **agent 自身管线走 NV12→H264，不受影响**，不要拿探针的偏色去怀疑管线。
+
+**统计口径提醒**：`sent_` 只计被接受的命令，被 IK 拒绝的走 `rejected_`。
+断言"有东西发生"写成 `sent增 + rejected增 == 1`，**不能只断 `sent > before`**。
+
+### 8.9 软边界增益衰减（同日续，80/80）
+
+**为什么**：§8.8 记的「边界持续拒绝」虽是物理必然，但体感差。用户选择做**衰减**而非换绝对模式
+（绝对模式丢跟手手感）。
+
+**怎么做**：`boundary_weight(pos_mm, axis)` 逐轴算权重，`gain * w` 后再发 `movexyz`。
+
+| 配置 | 默认 | 作用 |
+|---|---|---|
+| `soft_boundary` | `true` | 总开关，**关掉即旧行为**（有回归测试钉死） |
+| `soft_margin` | `0.15` | 从每端内缩比例 = 慢速区宽度 |
+| `soft_min_gain` | `0.10` | 衰减下限 |
+
+**四个非直观点（都是踩出来的）**：
+
+1. **必须 smoothstep，不能线性** —— 线性衰减在进入边界那一刻**导数跳变**，手感是"突然变沉"。
+   `smoothstep01` 两端导数为 0，进出都平滑。
+2. **下限不能为 0** —— 为 0 时臂**无法被命令走出慢速区**（任何方向的步长都被缩进死区），
+   只能靠手离开画面才复位。这是"防卡死"而非"留点力气"。
+3. **必须逐轴独立**，不能全局降权 —— 臂常常贴着一面墙而另外两轴仍有空间，全局降权会
+   为了修一个问题把自由轴也拖慢。
+4. **衰减需要绝对位置** ⇒ delta 路线**重新开始维护 `last_good_mm_`**（从应答 `tcp` 读）。
+   ⚠️ 注意这跟 §8.8 第 3 条说的"删掉死写入"**不矛盾**：那时写进去没人读，现在
+   `boundary_weight()` 每帧都读。改这类"曾经的死代码"前先 grep 确认现在有没有消费者。
+   ⚠️ **局限**：真机无位置反馈（坑 7），用的是**命令值**代理，sim 准确、真机近似。
+
+**测试判据的坑**：我原以为 taper 会把步长压进死区从而 `skipped` 增长。
+实际 `soft_min_gain(0.10) × 27.09mm ≈ 2.7mm > deadzone(0.5mm)` ⇒ **仍然发送**。
+**正确判据是"下发步长被缩小"（13.54 → 1.35），不是 skipped 增长。**
+
+### 8.10 「后端不可达」原本完全静默（🔥 已修，值得单独记）
+
+真机跑 20s 后 `[ROBOT]` **只有 1 行** `control branch started`，没有任何失败提示，
+让我误以为在用、实际一次没连上。根因：`connect_if_needed()` 的连接失败日志在
+**`CA_LOG_DEBUG`**，默认 `info` 看不见；而 `caps/home/movexyz` 全部依赖连接成功，
+所以**整条分支零输出** —— 与上一轮修的「`movexyz` 成功日志藏在 DEBUG」同一类问题。
+
+修法：**首次失败 WARN 一次**（`connect_failed_warned_` 锁存防每 2s 刷屏），
+**恢复时 INFO 并重新武装锁存**。测试 `robot_unreachable_backend_retries_and_recovers` 钉住
+"重试受限 + 后端出现后自愈 + 自愈后真能发指令"。
+
+**教训（可推广）**：**"分支启动了"和"分支在干活"是两件事**。任何"可选/降级"的旁路分支，
+都必须有一条 info 级别的"我现在是死的"的明示，否则操作者无法区分"没动作"和"坏了"。
+
+### 8.11 僵尸监听端口（🔥 新坑，通用性高）
+
+`netstat -ano` 报 `:9100 LISTENING pid=24236`，但该进程**早已不存在**（`tasklist` 查无），
+手工 `connect` 被**积极拒绝**（WinError 10061）。
+
+→ **判断一个服务是否活着，不能只看 `netstat`**，必须**实际发一条协议命令看有没有应答**。
+宿主回收进程树（§7.9 的机制）会留下这种"端口在、连不上"的残留。
+本机还叠加了 **Python 文本读取的编码陷阱**：日志是 UTF-16，用 `splitlines()` 直接读
+会把行切碎（表现为"6083 行里 0 条 `[ROBOT]`"）—— 二进制读 + 显式 `decode('utf-16')` 才对。
+
+
+### 8.12 🔴 包围盒 ≠ 可达域（真机「手在动、臂不动」的根因，83/83）
+
+**症状**：真机跑起来链路全绿（`cmd=movexyz ... ok` 一直刷、`ctest` 全过），
+但**臂物理上纹丝不动**。
+
+**根因（两层，缺一不可）**：增益与软边界**都以 `caps.workspace` 为基准**，
+而 `caps.workspace` 是**几何可达包围盒，不是 IK 可解域**，虚大 1.6–3.5×。
+
+三轴实测（**绝对 `moveto` 二分**，HOME 高度，tol 0.25mm）：
+
+| 轴 | caps 包围盒 | 实测可达域 | span | HOME 负向余量 | HOME 正向余量 | 盒虚大 |
+|---|---|---|---|---|---|---|
+| X (front) | `[40.46, 175.88]` | **`[105.78, 144.78]`** | **39.0** | **9.25** | 29.75 | **3.5×** |
+| Y (left) | `[-153.01, 153.01]` | `[-88.00, 88.00]` | 176.0 | 88 | 88（居中） | 1.7× |
+| Z (up) | `[49.08, 114.68]` | **`[72.97, 114.47]`** | **41.5** | 36.25 | **5.25** | 1.6× |
+
+**为什么必须用绝对法**：`moveto` 测的是"该点**本身**是否 IK 可解"（点的属性）；
+`movexyz` 逐步只能测"沿**这条路径**能走多远"（受关节耦合干扰）。绝对法可二分到 0.25mm。
+
+**故障链**：
+1. 增益 `axis_scale(span) = span/0.5` ⇒ X 轴用盒宽 `135.43 → 270.85`。
+   手 `delta.y=0.10` → 步长 **27.09mm**；而 HOME 处 -X 真实余量仅 **9.25mm**
+   ⇒ **第一步必然越界**。
+2. 软边界也用盒 ⇒ HOME"距边界 60mm" > margin，权重恒 `1.0`，**完全不衰减**。
+   首帧被拒后 `learn_from_rejection` 把 `eff_min_[0]` 收到**当前位置** ⇒ 权重掉到下限
+   `0.10` ⇒ 顶墙抑制把整条轴**锁死** ⇒ "臂一动都不动"。
+
+> **教训（可推广）**：**衰减/校验机制本身没坏，是它的坐标系错了。**
+> 用"API 声明的范围"当物理真值，是这类静默失效的通用形态 —— 尺子错了，曲线再精细也没用。
+
+**修复三件套**：
+1. **增益基准换实测 span**：`reach_span_x/y/z = 39.0/176.0/41.5`（**实测值，非 caps 推导**）。
+   `axis_scale(float span)` 签名由 `(lo,hi)` 改成只收 `span`。
+2. **被拒后对半细探** `soft_probe_on_reject` + `soft_probe_tries=2`：首步被拒 → 步长 ×0.5
+   重试，救回一个子步。**条件必须同时含 `soft_boundary`**（否则关掉软边界时细探还在跑，
+   破坏"回到旧行为"的逃生门 —— 这个 bug 被测试抓到了）。
+3. **`effective_bounds()` 统一算边界 + margin**：学到的边界优先；否则以 `caps.home_tcp`
+   为中心、`measured_span` 为宽的带；`reach_span_*=0` 时回退 caps 盒。
+   `boundary_weight()` 与 `push_out_of_bound()` 共用它 ⇒ **慢速区宽度也按真实可达域算**。
+
+**修前 vs 修后（LIVE 实测）**：
+
+| | 修前 | 修后 |
+|---|---|---|
+| 首帧步长 (X) | 27.09mm | **7.80mm** |
+| 顶墙结果 | `sent 2, rejected 1`，臂几乎不动 | **`sent 8, rejected 1, x travelled 29.25 mm`** |
+| 真实余量 | 9.25mm（-X） | 29.75mm（+X），用满 **98%** |
+
+**回归防线**：`robot_live_backend_drives_sim_arm` 加**位移断言**
+`ASSERT(travelled > 10.0f)` —— **链路绿 ≠ 臂动了**。只数 sent/rejected 是测不出这个 bug 的。
+
+**测试侧的连带坑**：
+- `test_cfg()` 必须把 `reach_span_*` **显式设 0**（回退 caps 盒），否则测试继承生产 span，
+  与假 caps 不匹配 → `robot_soft_boundary_tapers_gain_monotonically` FAIL。
+- **`soft_margin` 默认是 0.15，不是 0.20**（记错就把测试取点算歪）。
+- **细探生效后，第 1 帧 `sent` 就会增加**；第 2 帧起 `learn_from_rejection` 已把 `eff_max_`
+  收到当前位置 → 顶墙抑制直接 skip（**正确行为**）。断言别写 `sent_after > sent_mid`。
+- 假臂拒墙阈值要卡在**原步长与折半步长之间**（27.09 → 15.0 → 13.54）。
+- `sscanf` 触发 MSVC **C4996** ⇒ 改 `std::stof` + `find_first_of`/`substr`。
+
+**工具**：`carmera-agent/scripts/measure_reach.py`（粗扫 + 二分，`--tol` 默认 0.25mm，
+直接打印可粘进 yaml 的 `reach_span_*` 片段）。
+⚠️ **换臂 / 改机械结构后必须重跑它** —— 这三个数是这台臂的物理属性，不是协议属性。
+
+
+### 8.13 「没有命令下发」= robot 分支从未启动（2026-09-29，静默型故障）
+
+**症状**：Web UI 里 Hand 识别完全正常（`OPEN_PALM` conf 0.99、`REF LOCKED`、
+`d=[-8.896,-96.158,2.857]` —— 数据都在），但 armppilot-backend 日志里
+**一行 `[ROBOT]` 都没有**，臂当然不动。
+
+**根因（双保险都失效）**：
+1. `config/camera-agent.yaml` 的 **`robot.enable: false`**（生产默认，我上一轮做测试没改回来）
+2. 仓库根 `start.bat` 的参数解析表**根本没有 `--robot*` 这一族**，
+   `AGENT_ARGS` **从不拼接 `--robot`**（`start-joint.bat` 同样）
+
+两条任一都能让 `start_robot()` 在第一行 `if (!cfg_.robot.enable) return;` 静默返回。
+**连 WARN 都没有** —— 因为那条 WARN（`robot.enable is true but ai.enable is false`）
+在**下一行**的分支里，前置条件恰好相反。这是最阴的一层。
+
+> 🔑 **三类症状的判据（务必背下来）**
+> | 日志表现 | 含义 |
+> |---|---|
+> | **连 `[ROBOT]` banner 都没有** | **分支从未启动**（配置关了 / 参数没传） |
+> | 有 `control branch started`，之后没别的 | 启动了但连不上后端（看 WARN） |
+> | 有 `connected` + `cmd=... ok` 但臂不动 | 命令发了但物理没动（→ §8.12 尺子问题） |
+>
+> "能看到分支输出" ≠ "分支在干活"，但**"看不到分支输出"首先怀疑它没启动**。
+
+**修复**：
+1. `camera-agent.yaml`：`robot.enable: true`（仍需 AI hand 模式；UI 切手势即开关）。
+2. `start.bat` + `start-joint.bat`：加 `--robot`/`--no-robot`/`--robot-host`/`--robot-port`/
+   `--robot-map` 解析，**默认 `ENABLE_ROBOT=1`**（与 `--ai` 同构），
+   `--no-ai` 时自动一并关闭并打印 `[i] robot control OFF (--no-ai)`。
+3. `StreamController::start_robot()`：未启用时打 **INFO**
+   `[ROBOT] disabled (robot.enable=false, no --robot) - gesture control is off`。
+   **"关掉了"必须有一条 INFO**，否则操作者无法区分"没开"和"坏了"（§8.10 同族）。
+
+**验证手法（本例真正有效的）**：
+- **用真实代码块干跑**：把 `start.bat` 的解析区（1..177 行）+ robot 块（真实行）拼成一个
+  临时 .bat，`exit /b 0` 后 `echo` 出 `AGENT_ARGS`，4 组参数逐一核对拼装结果。
+  这比读代码可靠，也能抓到延迟展开（`!VAR!`）的顺序错误。
+  ⚠️ 临时 .bat **必须落在工作区内**（`/tmp` 在 Git Bash 与 Python 里不是同一个目录，见 §2）。
+- **端到端必须一次调用内跑完**：把 backend + agent 的启停和日志抓取写进**一个**
+  bash 脚本里执行。分两次调用的话，宿主会在工具调用结束时回收整棵进程树（§7.9），
+  第二次调用看到的 backend 已经死了 —— 会误判成"连不上"。
+
+**顺手修掉的历史债**：`start-joint.bat` 原来是**纯 LF**（391 行零 CRLF），
+而它用了 `call :pick_exe` —— 按铁律 6 这是潜在的 `call :label` 假 FAIL。已整体转 CRLF。
+
+
+### 8.14 降增益抑制手抖（2026-09-29，85/85）—— 手感参数怎么调 & 怎么钉住
+
+**诉求**：能控了，但手/臂位移比例想大一些（非等比例），用降幅吸收手部波动。
+
+**唯一正确的旋钮是 `gain_x/y/z`**（CLI `--robot-gain-*` > yaml > 默认，三级覆盖），
+**不动 `motion_deadzone`** —— 那是抖动的硬下限，改了会把"故意的小动作"一起吃掉。
+
+**公式**：`step_mm = hand_delta(归一化) × (reach_span_axis / 0.5) × gain_axis × soft_boundary`
+
+**为什么三轴不能给同一个数**：`reach_span` 差 4.5 倍（Y=176mm vs X=39mm）。
+统一 0.25 会让 Y 轴过钝。**三轴各自按 span 归一化后**，0.25/0.5/0.25 才是**相近的手感**。
+
+| 轴 | span | gain | 手抖 0.02 | vs 0.5mm 门槛 | 故意动 0.10 |
+|---|---|---|---|---|---|
+| X | 39.0 | 0.25 | **0.39mm** | **被滤除** ✅ | 1.95mm |
+| Y | 176.0 | 0.50 | 1.76mm | 通过 | 8.80mm |
+| Z | 41.5 | 0.25 | **0.42mm** | **被滤除** ✅ | 2.08mm |
+
+> 🔑 **"解决波动"的机制**：降 gain 后 X/Z 的抖动步长落到 `deadzone_mm=0.5` 之下，
+> **被自然滤除**，不需要加滤波。代价是 X/Z 慢速小动作也不动。用户抱怨"迟钝"就上调该轴 gain。
+> 这条算术本身值得记住：**降 gain 和滤波是两个可互相替代的手段，前者更便宜**。
+
+**手感参数怎么钉住（这条是本轮的真正经验）**：
+`gain_*` 属于**手感**，行为测试里必须 **pin 成 1.0**（否则降 gain 会让硬编码的步长断言
+`ASSERT(seen > 26.0f)` 连带变红，测试从"验行为"退化成"验手感"）。但 pin 之后，
+**改坏了手感值不会让任何测试变红** —— 所以需要一个**专门的 feel pin 测试**
+（`robot_shipped_gains_are_the_documented_feel`）把 shipped 值 + 步长表写成算术断言，
+外加一条 `config_robot_gains_load_from_yaml` 保证 yaml 与内置默认一致。
+**"文档写一套、代码跑一套"只能靠这种 pin 防住。**
+
+**验证结果**：sim 85/85 · gst 85/85 · LIVE `x travelled 29.25mm` · 验收 17/17 ·
+gst 0 warning/0 error；端到端（真 backend + 真 agent 完整进程 + 生产 yaml +
+`--ai-mode hand --robot`）拿到 `control branch started` → `connected` →
+`caps protocol=2` → `cmd=home ok`。
+
+**本轮新坑（三条都通用，不止这个项目）**：
+
+1. 🔴 **`Start-Process -WindowStyle Hidden` 会让 armpilot-backend 活着但永不监听**。
+   进程 `HasExited=False`、stdout/stderr 全空、15 秒 `Get-NetTCPConnection -LocalPort 9100`
+   恒为 0；**去掉 `-WindowStyle Hidden`（默认新控制台窗口）后 t=1 就 `conn=1`**。
+   以后起 backend 一律不加 Hidden。排查手法：`Get-NetTCPConnection` 轮询 + 写结果文件。
+2. **Bash 工具不能跑 `.sh`** —— 会走 `wsl.exe` 被安全策略拦（本机 PATH 遮蔽同族）。
+   端到端脚本只能走 PowerShell。
+3. **PowerShell 工具吞 `Start-Process` 的子进程输出**（老坑，§2/§3.1 同族），
+   但 **`& exe ... 2>&1 | Out-String` 是能拿到输出的** —— 要抓 agent 日志就用这个，
+   别用 `Start-Process -RedirectStandardOutput`（会得到 0 字节文件）。
+
+**另两条约束（顺带确认）**：
+- `--source` 只吃**单个元素名**（直接拼进 pipeline），传整条 `filesrc ! decodebin ...` 会报
+  `element not installed`；**文件源不是受支持路径**，无摄像头验证用 `videotestsrc`。
+- 写 C++ 源码**不要用 bash heredoc**：`f << "robot:\n";` 里的 `\n` 会被 shell 处理掉变成
+  `robot://n`（**第一行中招，后续行幸免** —— 这种"只坏一行"最难查）。用 Write/Edit 工具写。
+

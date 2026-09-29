@@ -13,6 +13,7 @@
 #include "camera_agent/video_pipeline.h"
 #include "camera_agent/ai/ai_pipeline.h"
 #include "camera_agent/metadata/metadata_manager.h"
+#include "camera_agent/robot/robot_link.h"
 
 namespace ca {
 
@@ -77,6 +78,17 @@ public:
     MetadataManager&       metadata()       { return meta_; }
     const MetadataManager& metadata() const { return meta_; }
 
+    // ---- Robot control branch (gesture -> MeArmPilot) ---------------------
+    // Starts the gesture-driven arm control. Same failure contract as the AI and
+    // metadata branches: it owns a thread and a bounded queue, and everything
+    // that can go wrong (backend absent, refusing, slow) degrades to WARN logs.
+    // Only fed while the AI branch produces Hand frames, i.e. while the web UI
+    // has the interface switched to gesture recognition.
+    void start_robot();
+
+    RobotLink&       robot()       { return robot_; }
+    const RobotLink& robot() const { return robot_; }
+
 private:
     void on_status(StreamStatus s);
     void reconnect_loop();
@@ -117,6 +129,11 @@ private:
     // AI branch: owns its own thread and bounded queue. It is completely
     // optional - if it never starts, nothing else changes.
     AIPipeline ai_;
+
+    // Robot control branch: consumes HandState and drives MeArmPilot over TCP.
+    // Optional and off by default; declared before ai_ so it outlives the AI
+    // thread that produces its input.
+    RobotLink robot_;
 
     // Last AI frame seen - mirrored here so the metadata heartbeat can report
     // LAST_FRAME_ID / LAST_TIMESTAMP (spec 13) without touching AI internals.

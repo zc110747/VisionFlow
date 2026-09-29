@@ -243,6 +243,61 @@ bool load_config(Config& cfg, const std::string& path) {
         cfg.metadata.skip_tls_verify =
             as_bool(find(*n, "insecure"), cfg.metadata.skip_tls_verify);
     }
+    // ---- robot branch (gesture -> MeArmPilot) ------------------------------
+    // Optional and off by default. Like the metadata branch, nothing here is
+    // validated into a hard failure: a bad value is logged and the branch stays
+    // inert, so an operator can never break the video stream with a typo.
+    if (auto* n = find(root, "robot")) {
+        cfg.robot.enable       = as_bool(find(*n, "enable"), cfg.robot.enable);
+        cfg.robot.host         = as_str(find(*n, "host"), cfg.robot.host);
+        cfg.robot.port         = as_int(find(*n, "port"), cfg.robot.port);
+        cfg.robot.timeout_ms   = as_int(find(*n, "timeout_ms"), cfg.robot.timeout_ms);
+        cfg.robot.reconnect_ms = as_int(find(*n, "reconnect_ms"), cfg.robot.reconnect_ms);
+        cfg.robot.map_mode     = as_str(find(*n, "map_mode"), cfg.robot.map_mode);
+        cfg.robot.rate_hz      = as_int(find(*n, "rate_hz"), cfg.robot.rate_hz);
+        cfg.robot.gain_x       = as_float(find(*n, "gain_x"), cfg.robot.gain_x);
+        cfg.robot.gain_y       = as_float(find(*n, "gain_y"), cfg.robot.gain_y);
+        cfg.robot.gain_z       = as_float(find(*n, "gain_z"), cfg.robot.gain_z);
+        cfg.robot.deadzone_mm  = as_float(find(*n, "deadzone_mm"), cfg.robot.deadzone_mm);
+        cfg.robot.soft_boundary =
+            as_bool(find(*n, "soft_boundary"), cfg.robot.soft_boundary);
+        cfg.robot.soft_margin  = as_float(find(*n, "soft_margin"), cfg.robot.soft_margin);
+        cfg.robot.soft_min_gain =
+            as_float(find(*n, "soft_min_gain"), cfg.robot.soft_min_gain);
+        cfg.robot.reach_span_x =
+            as_float(find(*n, "reach_span_x"), cfg.robot.reach_span_x);
+        cfg.robot.reach_span_y =
+            as_float(find(*n, "reach_span_y"), cfg.robot.reach_span_y);
+        cfg.robot.reach_span_z =
+            as_float(find(*n, "reach_span_z"), cfg.robot.reach_span_z);
+        cfg.robot.soft_probe_on_reject =
+            as_bool(find(*n, "soft_probe_on_reject"), cfg.robot.soft_probe_on_reject);
+        cfg.robot.soft_probe_tries =
+            as_int(find(*n, "soft_probe_tries"), cfg.robot.soft_probe_tries);
+        cfg.robot.gesture_home = as_str(find(*n, "gesture_home"), cfg.robot.gesture_home);
+        cfg.robot.gesture_gripper =
+            as_bool(find(*n, "gesture_gripper"), cfg.robot.gesture_gripper);
+        cfg.robot.home_on_presence =
+            as_bool(find(*n, "home_on_presence"), cfg.robot.home_on_presence);
+        cfg.robot.lost_frames  = as_int(find(*n, "lost_frames"), cfg.robot.lost_frames);
+        cfg.robot.log_commands = as_bool(find(*n, "log_commands"), cfg.robot.log_commands);
+
+        // Closed vocabularies, same policy the hand depth source uses: an
+        // unknown value would silently pick a default branch and behave in a way
+        // nobody asked for, so keep the previous value and say so.
+        if (cfg.robot.map_mode != "delta" && cfg.robot.map_mode != "absolute") {
+            CA_LOG_WARN("[config] robot.map_mode '{}' unknown (delta | absolute) - keeping default",
+                        cfg.robot.map_mode);
+            cfg.robot.map_mode = RobotConfig{}.map_mode;
+        }
+        if (cfg.robot.gesture_home != "open_palm" &&
+            cfg.robot.gesture_home != "fist" &&
+            cfg.robot.gesture_home != "off") {
+            CA_LOG_WARN("[config] robot.gesture_home '{}' unknown (open_palm | fist | off) - keeping default",
+                        cfg.robot.gesture_home);
+            cfg.robot.gesture_home = RobotConfig{}.gesture_home;
+        }
+    }
     cfg.device_id = as_str(find(root, "device_id"), cfg.device_id);
     cfg.log_level = as_str(find(root, "log_level"), cfg.log_level);
     return true;

@@ -474,6 +474,335 @@ python scripts/analyze_hand_landmarks.py mock.jsonl --hist          # 看双峰�
 
 ---
 
+## 手势 → 机械臂（Phase 2：TCP 控制 MeArmPilot）
+
+> **边界**：这一段**消费** `HandState`，反向不成立 —— `hand_types.h` 明确写着"Phase 2 才把
+> HandState→RobotCommand 放到**另一个项目**，这里不许知道机器人/IK/舵机/MuJoCo/MeArmPilot"。
+> 所以依赖是单向的：`HandState` 不知道 `RobotLink` 存在，`Hand*` 相关代码**未被本次改动触碰**。
+
+```
+HandState ─► RobotLink(映射/限速/边沿) ─► IJsonLineClient ─► TCP :9100 ─► MeArmPilot(armpilot-backend)
+```
+
+### 生效条件（三条同时满足，缺一不影响视频）
+
+1. Web UI 切到 **`ai-hand`（手势识别）**；`ai-y` / `ai-y-pose` / `ai-off` 下机器人分支不消费任何帧。
+2. 启动带 `--robot`（等价 `robot.enable: true`）。**仓库根 `start.bat` 默认就带**，
+   所以联合运行时不必手动加；`--no-robot` 可关掉。
+3. 目标 `host:port` 上有 MeArmPilot 在监听。**连不上只 WARN，不阻塞视频/AI** —— 视频链路
+   照常推流，机器人分支自己退避重连（默认 2s）。
+
+> 🔥 **2026-09-29 踩过的坑：这条分支曾经"完全静默"。** 症状是手在动、臂不动、日志里
+> **连一行 `[ROBOT]` 都没有** —— 因为 `robot.enable` 默认 `false` 且启动器不透传 `--robot`，
+> `start_robot()` 直接 `return`，整条分支不存在。修法：① 默认值改 `true`；
+> ② 两个启动器（`start.bat` / `start-joint.bat`）默认透传 `--robot`；
+> ③ `start_robot()` 在未启用时**打一条 INFO**（`[ROBOT] disabled ...`），
+> 让"没开"和"开了但坏了"在日志里可区分。
+
+### 启动器参数
+
+```bat
+start.bat                          :: 默认 --ai --robot（UI 切手势即开始控臂）
+start.bat --no-robot               :: 只要视频 + AI，不要机器人分支
+start.bat --robot-host 10.0.0.5 --robot-port 9200
+start.bat --robot-map absolute     :: 换绝对定位路线（"指着走"）
+start.bat --no-ai                  :: robot 自动一并关闭并打印提示（手势依赖 AI 分支）
+```
+
+### 行为契约
+
+| 场景 | 行为 |
+|---|---|
+| 手离开画面 | 回归 **HOME**（`lost_frames` 帧确认离开） |
+| 手**初次**进入画面 | **不**再发一次 HOME（`open()` 已发过），只记录 presence |
+| 手**重新**进入画面 | 回归 HOME 并重锁参考点（不继承旧原点） |
+| 参考点未锁存 | **不发任何命令**（`reference_initialized == false` 时 delta 是到画幅原点的巨大位移） |
+| 握拳 / 张开 | `gripper close` / `gripper open`，**边沿触发**，保持不重复发 |
+| 传送指令 | 客户端自限速（`rate_hz`，默认 15Hz）；服务端**不**节流 |
+| 手推向已到的工作空间边界 | **软边界**把该轴增益逐步衰减（`soft_boundary`），臂减速贴边而非满速撞墙 |
+
+映射走 **`delta` 增量式（跟手）**：手帧间位移 → 臂位移。增益不是拍脑袋的数：
+`gesture-control.md §2.1` 推导为 `workspace 跨度 / 手在画面里的有效行程`，
+`gain_x|y|z` 是叠在上面的乘数。坐标轴按**重命名**（非置换）对齐：
+手 `dy`(前后)→臂 `X`(front)、手 `dx`(左右)→臂 `-Y`(left)、手 `dz`(上下)→臂 `Z`(up)。
+
+### 增益降幅：手大动、臂小动（`gain_x/y/z`，**默认已降**）
+
+**解决什么**：等比例（`gain = 1.0`）时，手的**自然抖动**也被 1:1 放大成臂的步长，臂一直在
+微动、"站不稳"，看起来就是"波动导致机械臂无法正确工作"。
+
+**做法**：只调 **`gain_x/y/z` 乘数**（不动 `motion_deadzone`，不改代码），让手的大幅移动
+对应臂的小幅移动。步长公式：
+
+```
+step_mm = hand_delta(归一化) × (reach_span_axis / 0.5) × gain_axis × soft_boundary
+```
+
+其中 `0.5` 是 `kHandActiveSpan`（手在画面里的有效行程基准）。**降幅后实测步长**：
+
+| 轴 | `reach_span` | `gain` | 手抖 0.02 | vs 0.5mm 硬门槛 | 故意动 0.10 |
+|---|---|---|---|---|---|
+| X (front) | 39.0 mm | **0.25** | **0.39 mm** | **被滤除** ✅ | 1.95 mm |
+| Y (left) | 176.0 mm | **0.50** | 1.76 mm | 通过 | 8.80 mm |
+| Z (up) | 41.5 mm | **0.25** | **0.42 mm** | **被滤除** ✅ | 2.08 mm |
+
+**为什么 X/Z 降 0.25、Y 只降 0.5**：Y 的实测 span（176mm）是 X 的 4.5 倍，等比例降 0.25
+会让 Y 轴过钝（手大动臂几乎不动）。三轴各自按 span 归一化后，0.25/0.5/0.25 得到的是
+**相近的手感灵敏度**，而不是相同的数字。
+
+**取舍（必须知道）**：
+- ✅ **收益**：X/Z 的手部抖动（0.02 → 0.39/0.42mm）落在 `deadzone_mm = 0.5` 的硬门槛
+  之下，被**自然滤除** —— 这正是"解决波动"的机制，不需要额外加滤波。
+- ⚠️ **代价**：X/Z 的**慢速小动作**（手位移 < ~0.025 归一化）也不再产生命令。若觉得
+  "迟钝"而非"稳"，**上调对应轴的 `gain`**（`--robot-gain-x 0.4` 等）即可。
+
+> 这两个默认值被 `robot_shipped_gains_are_the_documented_feel` 测试**钉住**（含步长表算术
+> 断言），并有一条 `config_robot_gains_load_from_yaml` 保证 yaml / 内置默认一致 —— 改默认
+> 值会同时打红两处，防止"文档写一套、代码跑一套"。
+
+### 软边界增益衰减（`soft_boundary`，**delta 路线专用**）
+
+**解决什么**：增量跟手下，手可以继续朝一个方向动而臂已经抵到工作空间边缘，于是之后
+每一步都被 `JOINT_LIMIT` 拒绝（实测一轮 20s `rejected=83 / sent=12`）。链路健康、臂不乱跳，
+但「手在动、臂不动」的体感很差，日志也被拒绝刷满。
+
+**做法**：每轴独立按"臂离该轴边界还有多远"衰减增益，贴边时衰减到 `soft_min_gain`（下限，
+不为 0）。姿态用 **cosine ease（smoothstep）**，两端导数为 0 —— 线性衰减会在进入边界的
+那一刻产生导数跳变，手感上是"突然变沉"。
+
+| 配置 | 默认 | 含义 |
+|---|---|---|
+| `soft_boundary` | `true` | 总开关。**关掉即回到旧行为**（有回归测试钉住） |
+| `soft_margin` | `0.15` | 从每端内缩的**比例**（占该轴 span），即"慢速区"宽度 |
+| `soft_min_gain` | `0.10` | 衰减下限。**不能为 0**：为 0 时臂无法被命令走出慢速区（任何方向的步长都被缩进死区） |
+| **`reach_span_x/y/z`** | **39 / 176 / 41.5** | **实测可达 span（mm）—— 增益与边界的基准**。0 = 回退 `caps` 包围盒 |
+| `soft_probe_on_reject` | `true` | 被拒后是否对半重探 |
+| `soft_probe_tries` | `2` | 重探次数（含原始尝试）。2 = 原步长 + 一次折半 |
+
+**换臂 / 改机械结构后必须重新实测**（输出了可直接粘进 yaml 的片段）：
+
+```bash
+python scripts/measure_reach.py            # 默认 127.0.0.1:9100，--tol 0.25 更精确
+```
+
+**三个实现要点**：
+
+1. **逐轴独立**，不做全局降权 —— 臂常常是贴着一面墙而在其它轴仍有空间，全局降权会为了
+   修一个问题把另外两个自由轴也拖慢。
+2. **衰减需要臂的绝对位置**，所以 delta 路线**重新开始维护 `last_good_mm_`**（从应答
+   `tcp` 读）。
+3. **⚠️ 局限（必须知道）**：真机**无位置反馈**（坑 7），这里用的是**命令值** `tcp` 作代理 ——
+   sim 上准确，真机上"命令值 vs 实际位置"若有偏差，衰减点会随之偏移。
+
+#### 为什么不能直接用 `caps` 的边界（实测推翻的第一版）
+
+`caps.workspace` 是**包围盒**，而且**严重虚大** —— 它由**几何可达**算出来，**不含 IK 是否解得开**。
+2026-09-29 用绝对定位（`moveto` 二分，`scripts/measure_reach.py`）在 HOME 高度实测：
+
+| 轴 | `caps` 包围盒 | **实测可达** | 实测 span | 虚大倍数 |
+|---|---|---|---|---|
+| X (front) | `[40.46, 175.88]` | **`[105.78, 144.78]`** | **39.0 mm** | **3.5×** |
+| Y (left) | `[-153.01, 153.01]` | **`[-88.00, 88.00]`** | **176.0 mm** | 1.7× |
+| Z (up) | `[49.08, 114.68]` | **`[72.97, 114.47]`** | **41.5 mm** | 1.6× |
+
+**而且 HOME 在三轴上都不居中** —— 这是比虚大更致命的一点：
+
+| 轴 | HOME | **负向余量** | **正向余量** |
+|---|---|---|---|
+| X | 115.03 | **9.25 mm** | 29.75 mm |
+| Y | 0 | 88 mm | 88 mm（唯一居中） |
+| Z | 109.22 | 36.25 mm | **5.25 mm** |
+
+所以"拿包围盒算离边界多远"在数学上就是错的：臂真正只剩 **9mm** 行程时，包围盒还说"还剩 60mm"，
+权重是 1，照发满速步长，继续被拒。（第一版就栽在这：真机 `rejected 21 / 25 帧`。）
+
+> **绝对定位 vs 步进**：`movexyz` 逐步走只测出"沿**这一条路径**能走多远"，会被关节耦合干扰；
+> `moveto` 直接问"这个位姿解得开吗"，答案才属于**点本身**。两者实测一致（X 步进 107~143 / 绝对 105.78~144.78），
+> 但绝对法可二分，能拿到 0.25mm 精度。
+
+#### 🔴 增益基准也必须是实测 span（这一步不做，臂就是不动）
+
+第一版修了"衰减边界"，但**增益仍按包围盒算** —— 这是本轮暴露的真正根因：
+
+```
+X 轴: axis_scale = (175.88 - 40.46) / 0.5 = 270.85
+手部 delta.y = 0.05  →  臂步长 0.05 × 270.85 = 13.5 mm
+但 HOME 处 -X 真实余量只有 9.25 mm  ←  一步就跨过头
+```
+
+| 轴 | 修复前步长（手动 0.05） | **修复后步长** | HOME 真实余量 |
+|---|---|---|---|
+| X | 13.5 mm ❌ 超过负向余量 | **1.95 mm** ✅ | -9.25 / +29.75 |
+| Y | 30.6 mm | **17.6 mm** ✅ | ±88 |
+| Z | 6.56 mm ❌ 超过正向余量 | **2.08 mm** ✅ | -36.25 / **+5.25** |
+
+修法：`axis_scale` 的输入从 `caps` 的 span 换成**实测 span**（`reach_span_x/y/z`）。
+
+- 值为 **0** 时回退到 `caps` 包围盒 —— 对"包围盒确实紧"的设备仍是正确行为，也是未实测设备的唯一合理默认。
+- 存的是 **span**（宽度）而非边界：带宽以 `caps.home` 为中心，换臂只需改宽度。
+
+#### 被拒 ≠ 此路不通：拒绝后「细探」
+
+即便步长按实测 span 算，`Z` 正向余量只有 **5.25mm** 这种极端情况仍可能被拒。而原来的学习逻辑是
+**一次拒绝就把该轴边界收到当前位置** —— 等于宣告"这个方向彻底不通"。实测 X 负向明明还有 9mm 可走。
+
+修法：**拒绝后按 `soft_probe_tries` 对半重探**（默认 2 = 原步长 + 一次折半）。半长仍低于死区才放弃。
+
+- **必须同时受 `soft_boundary` 约束**：那个开关是"关掉即回到功能出现前的行为"的逃生门，细探属于该功能。
+- 细探成功时，学习器只会看到"最终成功"，不会把边界锁在一个**刚被证明可达**的点上（接受分支会重新放宽）。
+- 实测效果：`big move: sent 1, rejected 1` —— 一次大步被拒后，半长步长被救回来了。
+
+#### 从拒绝里「学」边界（`eff_min_` / `eff_max_`）
+
+**唯一可信的信息源就是拒绝本身** —— 命令被拒 ⇒ 那个方向的目标不可达 ⇒ 有效边界至多
+在臂**当前所在**的位置。
+
+- **收紧**：拒绝时把该轴有效边界拉回到 `min(from+step, from)`。用 `from`（而非
+  `from+step`）很关键：被拒的命令**臂根本没动**，用目标值当边界会松一整步，
+  **每撞一次墙就多浪费一次拒绝**。
+- **放宽**：接受时按 `kRelaxFraction` 缓慢朝实际到达点外扩，且**每 8 次接受才放宽一次** ——
+  一次成功只证明**这一个点**可达，不代表整个面。
+- **复位**：`open()` 里清掉（`home` 已把臂移到已知位姿，旧的学习结果不再可信）。
+
+#### 慢速区宽度也必须按已学边界算
+
+`margin = soft_margin × span`。若用 `caps` 的 span（X 是 135.43），`0.15 × 135.43 = 20.3mm` ——
+**比整条真实 X 轴（39mm）的一半还宽**，臂一离开 HOME 就处在慢速区里，手感是**常年迟钝**而不是贴边减速。
+所以 `effective_bounds()` 统一返回"边界 + 该边界的 margin"，且学到的 span 缩小时**取与实测 span 的较大者**，
+避免慢速区塌缩成硬停。
+
+#### 顶墙时是「停止推进」，不是「减速推进」
+
+光有衰减还不够：边界收到臂卡死的位置后 `d=0`、权重=下限 `0.10`，
+但 `0.10 × 13.54mm ≈ 1.35mm` **仍大于死区 0.5mm** ⇒ 还是每帧发、每帧被拒。
+
+所以还要**方向敏感 + 顶墙抑制**：
+
+- **方向敏感**：朝边界方向的步长才衰减；**往回退的步长权重恒为 1**。
+  这保证了「顶住墙推不动，但永远能退回来」。
+- **顶墙抑制**：权重已到底且步长仍朝外 ⇒ **直接跳过（不发）**，与死区同语义。
+
+实测效果（`robot_live_backend_drives_sim_arm` 的 (i) 段，真 sim 后端，连推 25 帧）：
+
+| 版本 | rejected |
+|---|---|
+| 改动前 | **23** |
+| 只有衰减（第一版） | 21 |
+| + 学习边界 + 方向敏感 + 顶墙抑制 | **1** |
+
+**为什么不直接改成绝对模式**：`--robot-map absolute` 也能避开累积拒绝，但语义变成"指着走"，
+丢掉了跟手的手感。软边界保留跟手，只是让臂在边界处安静下来。
+
+### 七条协议坑（逐条有对应处理与测试）
+
+| # | 坑 | 处理 |
+|---|---|---|
+| 1 | 零/极小 delta 是**参数错误**（`zero displacement`） | 低于 `deadzone_mm` 直接跳过并计 `skipped`，**不是**故障 |
+| 2 | `state.tcp` 是**命令值**不是过程值 | 只当参考，绝不当作"已经到位"。delta 路线用它维护 `last_good_mm_` 作为**软边界的位置基准**（真机无反馈，命令值是唯一模型）；绝对路线的 `do_moveto` 用它做**目标比对**。两条路线共用同一个闩锁，但用途不同、不互相比对 |
+| 3 | 服务端不节流 | 客户端 `rate_hz` 自限 |
+| 4 | 包围盒内仍可能不可达（`OUT_OF_WORKSPACE`/`JOINT_LIMIT`） | 保留 `last_good`，**不回零**、不报错。**实测这是常态且远超预期**：包围盒虚大 1.6–3.5×（X 实测 39mm vs 盒 135mm），**HOME 处 -X 只剩 9.25mm、+Z 只剩 5.25mm**。故：① 增益基准改用实测 span；② 被拒后对半细探；③ 拒绝日志留 DEBUG 防刷屏，但**首次连接失败与细探成功是 INFO/WARN** |
+| 5 | 目标==当前位置产生零状态帧 | 下发前比对**最后下发目标**（不是应答值）。`last_good_mm_` 按上条只被绝对路线消费 |
+| 6 | 边界抄进客户端会漂 | **运行期边界仍一律从 `caps` 取**（实测 `ws=[40.4582,-153.012,49.0849]..[175.883,153.012,114.68]`）。但 `reach_span_*`（增益基准）是**实测值**而非从 `caps` 推导 —— 因为 `caps` 给不出真实可达域。它随机械结构变化，改结构必须重跑 `measure_reach.py` |
+| 7 | 真机无位置反馈 | 绿的链路**不等于**物理动了；界面必须区分"已下发"与"已到位"。成功下发打 `CA_LOG_INFO`，肉眼可核 |
+
+### 验收（一键，输出 PASS/FAIL 计数）
+
+```bash
+# 全部四级（Level 1 需要在 :9100 跑着 armpilot-backend.exe）
+python scripts/verify_gesture_arm.py
+
+# 没有后端也能跑 Level 2
+python scripts/verify_gesture_arm.py --no-live
+
+# 三轴可达域实测（换臂 / 改机械结构后必跑，用来刷新 reach_span_*）
+python scripts/measure_reach.py            # 需要 :9100 跑着 armpilot-backend.exe
+python scripts/measure_reach.py --tol 0.25 # 二分精度（mm），默认 0.25
+```
+
+四级阶梯（L2 下分 a/b/c 三组）与对应测试：
+
+| 级 | 验什么 | 测试 |
+|---|---|---|
+| L1 | VisionFlow 自己的指令直驱真 sim 臂（真 socket / 真 caps / 真 IK） | `robot_live_backend_drives_sim_arm`（`ARM_PILOT_LIVE=1` 才跑，`ctest` 保持无依赖） |
+| L2a | 合成像素 → HandState → 指令，对**已知几何真值**断言 | `robot_synthetic_hand_sequence_drives_arm`、`robot_synthetic_sequence_over_worker_thread` |
+| L2b | **真实采集帧**走同一条链路（无真值，断鲁棒性） | `robot_realframes_drive_arm_without_ground_truth`、`robot_realframes_over_worker_thread` |
+| **L2c** | **软边界 + 后端自愈**（实测 span 基准、被拒后细探、边界关闭时回到旧行为） | `robot_soft_boundary_uses_measured_span`、`robot_soft_probe_recovers_a_halved_step`、`robot_soft_probe_off_sends_only_the_original_step`、`robot_soft_boundary_tapers_gain_monotonically`、`robot_soft_boundary_off_is_the_old_behaviour`、`robot_soft_boundary_survives_rejections` |
+| **L2d** | **交付手感**（`gain` 默认值 + 降幅步长表被钉住，防文档/代码漂移） | `robot_shipped_gains_are_the_documented_feel`、`config_robot_gains_load_from_yaml` |
+| L3 | 实时摄像头手势控 sim 臂（**人工**） | 见下 |
+
+> L2c 是 2026-09-29 那次"手在动、臂不动"真机故障的回归防线。关键一条是
+> `robot_live_backend_drives_sim_arm` 里后来加的**位移断言**：
+> `ASSERT(travelled > 10.0f)` —— 只要链路是绿的但臂没真动，它就 FAIL。
+>
+> L2d 是"降 gain 抑制抖动"那次调优的防线。它存在的理由很实际：
+> `gain_x/y/z` 属于**手感**参数，最容易被随手改，而改错了不会让任何行为测试变红
+> （行为测试里 gain 被显式 pin 成 1.0）。所以专门用一条测试把 shipped 值 + 步长表
+> 写成算术断言，另一条保证 yaml 与内置默认一致。
+
+L3 人工步骤（**必须用 GStreamer 后端**，SIM 后端没有真摄像头）：
+
+```bat
+:: 先确认后端枚举到真设备（SIM 后端会报一台假的 "SIM Camera"，不可信）
+build-msvc-gst\src\camera-agent.exe --version      :: 期望 Backend : gstreamer
+build-msvc-gst\src\camera-agent.exe --list         :: 期望能看到 LRCP USB2.0 等真设备
+
+:: 再启动（MediaMTX 必须在跑，否则视频推流失败）
+build-msvc-gst\src\camera-agent.exe --ai --ai-mode hand --robot ^
+    --robot-host 127.0.0.1 --robot-port 9100 --config config/camera-agent.yaml ^
+    --source mfvideosrc --camera 0 --width 1280 --height 720 --fps 30
+```
+
+期望日志：`[ROBOT] connected to ...` → `caps protocol=2 ...` → 手移动时
+`cmd=movexyz delta=[..] ok` → 手离开再回来 `hand (re)entered the frame - returning HOME`。
+
+> **`--source` 要用 `mfvideosrc`，不是 `dshowvideosrc`。** 本机这台 LRCP USB2.0
+> 走的是 MediaFoundation 栈（`device.api = mediafoundation`）。
+
+### L3 实测记录（2026-09-29，LRCP USB2.0 1280×720@30）
+
+| 项 | 实测 |
+|---|---|
+| 设备枚举（GStreamer 后端） | `Camera 0: LRCP USB2.0`，最高 1280×720@30 |
+| 采集 + 编码 + 推流 | `Negotiated capture format: 1280x720 @ 30fps`，`Status: STREAMING -> rtsp://127.0.0.1:8554/camera01` |
+| 手部级联 | `[HAND] ready: palm=... landmark=...`，`conf=0.92~0.98 hand=right` |
+| 推理开销 | `infer=~20ms`，`[AI] fps=8.0`（子采样后） |
+| 握拳 → 夹爪 | **`[ROBOT] cmd=gripper action=close ok`** —— 真实手势真的驱动了夹爪 |
+| 增量跟手 | `cmd=movexyz delta=[-3.65,-7.95,1.81] ok` 等，量级 ±3~30mm |
+
+**两个实测暴露的可用性问题（已处理 / 待观察）**：
+
+1. **检测抖动会误判"手离开"**（已修）。手在画面里时掌心/landmark 级联会偶发漏检，
+   实测漏检以 **1–2 帧（≈0.25s）** 的短促形式出现，而 `lost_frames` 原默认 `3`
+   恰好压在这个区间上 ⇒ 一次闪烁就被判成"手离开了"，把臂拉回 HOME 并打断跟随
+   （20s 内触发 4 次）。已把 `lost_frames` 提到 **6（≈0.75s）**，改后同一场景
+   **重入触发降到 0–1 次**。这个值是对着 AI 推理率（~8Hz）算的，不是相机帧率。
+2. **撞工作空间边界后持续被拒**（**设计使然，非 bug**）。增量式跟手下，手可以继续
+   朝一个方向移动而臂已经到边界，于是之后每一步都被 `JOINT_LIMIT` 拒绝，直到手回退。
+   实测一轮 20s 出现 `rejected=83 / sent=12`。这是坑 4 的物理必然，**不是链路故障**
+   （`update()` 仍返回 true、链路不断、臂不乱跳）。必要时可用 `--robot-map absolute`
+   换成绝对定位路线绕开累积。
+
+> ⚠️ 上面第 2 条记录于**修复软边界之前**。当时的 `rejected=83` 里有相当一部分来自
+> "步长基于虚大的包围盒 ⇒ 首帧就越界" 这个真 bug（见坑 4）。修复后同一场景的
+> 拒绝大幅下降，且被拒时会有细探救回一个子步。**但"手顶到边界而臂已到位"这条物理
+> 必然性依旧存在**，只是不再被增益错误放大。
+
+---
+
+### 两个"必须说清楚"的验证局限
+
+1. **合成序列的拳头是注入的，不是画出来的**。画出来的拳头 MediaPipe 掌心模型**检出 0 个**；
+   裁夹具自身掌心区虽然过掌心模型，但被 landmark 模型以 `conf < 0.5` 拒绝 —— 两条路都得不到
+   `HandState`。所以拳头通过**注入真实采集的 landmark 表**覆盖（与
+   `hand_analyzer_tests.cpp` 冻结的那份**逐位相同**），并在脚本与测试里显式标 `KNOWN LIMITATION`。
+   连带约束：`gesture_confirm_frames = 5` 需要**连续 5 帧**，注入必须至少 5 帧才能过手势去抖。
+2. **真实帧没有几何真值**，所以 L2b 断言的是**鲁棒性**而不是精度：状态有限且在范围内、
+   参考点未锁存时 delta 恒为 0（这条不变式是防"首帧幽灵位移"的）、传输零故障零拒绝、
+   确实产生了指令。本机这套 40 帧实测检出率 **20/40 = 50%**（手贴脸被遮挡的另一半检不到，
+   这是数据的性质，不是失败）。
+
+---
+
 ## 验证流程
 
 ### 1. 单元测试（SIM 后端，无头）
@@ -484,7 +813,7 @@ ctest --test-dir build-msvc --output-on-failure
 ctest --test-dir build --output-on-failure
 ```
 
-覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、**运行时 AI 模式切换（Detect↔Pose、Detect↔Hand 不重启）**、手部（anchor 全 2016 值核对、黄金图 21 点亚毫像素比对、坐标映射/EMA/reference/deadzone/手势去抖、hand 报文逐字节固定）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）、**手势真机数据回归（实测开掌/握拳 landmark 逐位冻结，钉住 `kCurledRatio`）**。**56/56 通过**。
+覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、**运行时 AI 模式切换（Detect↔Pose、Detect↔Hand 不重启）**、手部（anchor 全 2016 值核对、黄金图 21 点亚毫像素比对、坐标映射/EMA/reference/deadzone/手势去抖、hand 报文逐字节固定）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）、**手势真机数据回归（实测开掌/握拳 landmark 逐位冻结，钉住 `kCurledRatio`）**、**机器人控制（`RobotLink` 状态机 + 七条协议坑、合成序列对已知几何真值、真实帧鲁棒性、真 socket 直驱 sim 臂并断言**臂真的位移**、软边界（曲线/贴边减速/关闭即旧行为/**实测 span 基准**/**拒绝后细探**/**细探开关**）、后端不可达重试与自愈、**交付手感（`gain` 默认值 + 降幅步长表被算术钉住、yaml 与内置默认一致）**）**。**85/85 通过**（sim / gstreamer / LIVE 三模式各跑一遍）。
 
 ### 2. 端到端验收（`scripts/e2e-test.ps1`，真实 GStreamer 后端）
 
@@ -722,7 +1051,8 @@ Camera (mfvideosrc 1280x720@30)
 
 ### 单元测试（无头端到端）
 
-`tests/ai_detector_tests.cpp` 三个用例（已合入 ctest，56/56 总通过）：
+`tests/ai_detector_tests.cpp` 三个用例（已合入 ctest；含本节在内当时总计 76 个用例，
+后续加入机器人/软边界等用例后当前总数为 **85/85**）：
 
 - `ai_detector_bus_image`：在 Ultralytics 官方 `bus.jpg` 上跑真模型，断言 ≥1 个 person、bbox 全在 `[0,w]×[0,h]` 内。**实测 4 个 person**。
 - `ai_tracker_stable_ids`：3 帧直线漂移的合成检测 → 1 个稳定 track id。
@@ -919,7 +1249,7 @@ std::unique_ptr<IMetadataTransport> create_metadata_transport(const MetadataConf
 | 5 | **AI 异常** | 模型路径故意填错 `models/does-not-exist.onnx` + `--ai --metadata`（`--source videotestsrc`） | 日志 `[AI] model file not found` → `[AI] model init failed (...), video stream continues without AI` → `[warning] [AI] not started; video stream is unaffected`；视频全程 `STREAMING`（frames=424 `dropped=0` bitrate≈4070kbps），AI 不产出结果 → metadata 只剩心跳（`sent=3`，无 `frame` 消息）；mock 收到 cam_t5 共 3 条；agent 正常退出（exit=0） |
 | 6 | **AI 关闭** | `--no-ai --metadata`（`--source videotestsrc`） | 视频正常 `STREAMING`（frames=426 `dropped=0` bitrate≈3897kbps）；管线不含 tee/aisplit（AI 分支完全不挂载）；metadata 仅发心跳（每 5s 一条，`sent=3`，mock 收到 cam_t6 共 3 条）；agent 正常退出（exit=0） |
 
-单元测试 **56/56 通过**；下表为 Metadata 分支直接相关的 9 个（手部用例见 `tests/hand_wiring_tests.cpp`）：
+单元测试全部通过（撰写本节时为 **76/76**，当前为 **85/85**）；下表为 Metadata 分支直接相关的 9 个（手部用例见 `tests/hand_wiring_tests.cpp`）：
 
 | 用例 | 断言要点 |
 |------|----------|

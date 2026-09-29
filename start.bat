@@ -126,6 +126,18 @@ if not defined AI_FPS         set AI_FPS=8
 set "CAMERA_ARG="
 set "SOURCE_ARG="
 set "AI_ARG="
+set "ROBOT_ARG="
+
+REM Robot control (gesture -> MeArmPilot) is ON by default, mirroring --ai: the
+REM branch only ever acts on HandState, and the web UI being in "hand" mode is
+REM what produces one. So an operator who never switches to gesture recognition
+REM sees zero effect, and an absent backend is only a WARN.
+REM Default host/port match camera-agent.yaml. Use --robot-host/--robot-port to
+REM point at a remote MeArmPilot, --no-robot to opt out entirely.
+set "ENABLE_ROBOT="
+set "ROBOT_HOST="
+set "ROBOT_PORT="
+set "ROBOT_MAP="
 
 REM ---- parse args ----
 set "_ctx="
@@ -136,6 +148,9 @@ for %%a in (%*) do (
     if "!_ctx!"=="source" set "CAMERA_SOURCE=%%~a"
     if "!_ctx!"=="aifps"  set "AI_FPS=%%~a"
     if "!_ctx!"=="aimode" set "AI_MODE=%%~a"
+    if "!_ctx!"=="robothost" set "ROBOT_HOST=%%~a"
+    if "!_ctx!"=="robotport" set "ROBOT_PORT=%%~a"
+    if "!_ctx!"=="robotmap"  set "ROBOT_MAP=%%~a"
     set "_ctx="
   ) else (
     if /i "%%a"=="--no-browser"   set NO_BROWSER=1
@@ -150,6 +165,11 @@ for %%a in (%*) do (
     if /i "%%a"=="--no-ai"        set ENABLE_AI=0
     if /i "%%a"=="--metadata"     set ENABLE_METADATA=1
     if /i "%%a"=="--no-metadata"  set ENABLE_METADATA=0
+    if /i "%%a"=="--robot"        set ENABLE_ROBOT=1
+    if /i "%%a"=="--no-robot"     set ENABLE_ROBOT=0
+    if /i "%%a"=="--robot-host"   set "_ctx=robothost"
+    if /i "%%a"=="--robot-port"   set "_ctx=robotport"
+    if /i "%%a"=="--robot-map"    set "_ctx=robotmap"
   )
 )
 if defined CAMERA_ID   set "CAMERA_ARG=--camera %CAMERA_ID%"
@@ -338,8 +358,27 @@ if "%ENABLE_METADATA%"=="1" (
   REM would be frozen at parse time, before the --ai line above ran.
   set "AI_ARG=!AI_ARG! --metadata --metadata-url !METADATA_URL! --metadata-camera-id %STREAM_ID%"
 )
+REM ---- robot control flags (default ON, needs AI) ----------------------
+REM Gesture control rides the AI branch, so --robot is only meaningful next to
+REM --ai. Order matters: this block runs AFTER AI_ARG is final.
+if not defined ENABLE_ROBOT set "ENABLE_ROBOT=1"
+if "%ENABLE_ROBOT%"=="1" if "%ENABLE_AI%"=="1" (
+  set "ROBOT_ARG=--robot"
+  if defined ROBOT_HOST set "ROBOT_ARG=!ROBOT_ARG! --robot-host !ROBOT_HOST!"
+  if defined ROBOT_PORT set "ROBOT_ARG=!ROBOT_ARG! --robot-port !ROBOT_PORT!"
+  if defined ROBOT_MAP  set "ROBOT_ARG=!ROBOT_ARG! --robot-map !ROBOT_MAP!"
+) else (
+  REM Explicitly disabled, or no AI branch to feed it. Say which.
+  if "%ENABLE_ROBOT%"=="0" (
+    echo [i]  robot control OFF  ^(--no-robot^)
+  ) else (
+    echo [i]  robot control OFF  ^(--no-ai: gesture control needs the AI branch^)
+  )
+)
+
 echo [2/3] Starting camera-agent --auto --stream %STREAM_ID% ...
 set "AGENT_ARGS=%CAMERA_ARG% --stream %STREAM_ID% --server 127.0.0.1 --port %RTSP_PORT% --auto %SOURCE_ARG% %AI_ARG%"
+if defined ROBOT_ARG set "AGENT_ARGS=!AGENT_ARGS! !ROBOT_ARG!"
 echo        args: %AGENT_ARGS%
 start "camera-agent" /D "%AGENT_DIR%" cmd /c ""%CA_EXE%" %AGENT_ARGS% --log-level info > "%LOGS%\agent.log" 2>&1"
 
