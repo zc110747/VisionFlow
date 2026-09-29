@@ -279,7 +279,12 @@ bool load_config(Config& cfg, const std::string& path) {
             as_bool(find(*n, "gesture_gripper"), cfg.robot.gesture_gripper);
         cfg.robot.home_on_presence =
             as_bool(find(*n, "home_on_presence"), cfg.robot.home_on_presence);
-        cfg.robot.lost_frames  = as_int(find(*n, "lost_frames"), cfg.robot.lost_frames);
+        // Renamed from `lost_frames`: the departure test is now a continuous
+        // TIME window (RobotConfig::hand_lost_ms), not a frame count. An old
+        // yaml still carrying `lost_frames` is simply ignored, which lands on
+        // the 2000 ms default - the value that rename was made to get.
+        cfg.robot.hand_lost_ms =
+            as_int(find(*n, "hand_lost_ms"), cfg.robot.hand_lost_ms);
         cfg.robot.gesture_mute_ms =
             as_int(find(*n, "gesture_mute_ms"), cfg.robot.gesture_mute_ms);
         cfg.robot.log_commands = as_bool(find(*n, "log_commands"), cfg.robot.log_commands);

@@ -144,28 +144,30 @@ robot:
   # hand sweeping half the frame moves the arm across its whole reachable span.
   # These knobs scale that down. Below 1.0 the arm moves LESS than the hand
   # ("hand big, arm small"), which is how hand-tracking jitter is kept out of
-  # the arm - a value of 0.25 means a normalised step of 0.10 moves the arm
-  # about a quarter of the way it used to.
+  # the arm.
   #
-  # Tuned 2026-09-29 against live use, after the operator reported the 1:1-ish
-  # response was too jumpy to work with:
+  # Tuned 2026-09-29 in two passes against live use: the 1:1-ish response was
+  # too jumpy (X/Z dropped to 0.25), then the operator reported the reach was
+  # still too short and asked for 0.4:
   #
   #   axis  span(mm)  gain   step at delta=0.02 (motion_deadzone)   at delta=0.10
-  #   X       39.0    0.25   0.39 mm  -> below 0.5 mm floor, filtered      1.95 mm
-  #   Y      176.0    0.50   1.76 mm  -> passes                             8.80 mm
-  #   Z       41.5    0.25   0.42 mm  -> below 0.5 mm floor, filtered      2.08 mm
+  #   X       39.0    0.40   0.62 mm  -> above 0.5 mm floor, reaches the arm  3.12 mm
+  #   Y      176.0    0.50   3.52 mm  -> passes                              17.60 mm
+  #   Z       41.5    0.40   0.66 mm  -> above 0.5 mm floor, reaches the arm  3.32 mm
   #
-  # Two consequences worth knowing before raising them further:
-  #   1. X/Z now filter out hand tremor entirely (their 0.02-normalised jitter
-  #      lands under the 0.5 mm `deadzone_mm` / kMinDeltaMm floor). That is the
-  #      point - but it also means slow, deliberate small hand moves on those
-  #      axes do nothing. Raise the gain if the arm feels dead rather than calm.
-  #   2. Y is deliberately NOT 0.25. Its span is 4.5x X's, so the same gain made
-  #      it conspicuously slower than the other two axes. Keep the three axes'
-  #      mm-per-normalised-unit ratios in mind, not the raw gain numbers.
-  gain_x: 0.25
+  # The trade the 0.25 -> 0.4 step makes, stated plainly:
+  #   1. At 0.25 an X/Z tremor (0.02-normalised) was 0.39-0.42 mm - UNDER the
+  #      0.5 mm `deadzone_mm` / kMinDeltaMm floor, so it was filtered out. At
+  #      0.4 it is 0.62-0.66 mm, so that same tremor now reaches the arm as a
+  #      small move. If the arm buzzes while the hand is meant to be still,
+  #      this is why - and the fix is the gain, not the deadzone (raising the
+  #      deadzone would swallow deliberate small moves too).
+  #   2. Y is deliberately NOT the same number. Its span is 4.5x X's, so the
+  #      same gain made it conspicuously slower than the other two axes. Keep
+  #      the three mm-per-normalised-unit products in mind, not the raw gains.
+  gain_x: 0.4
   gain_y: 0.5
-  gain_z: 0.25
+  gain_z: 0.4
 
   # Below this the command is skipped, not sent: an all-zero vector is a
   # parameter error on the server, and hand tremor would otherwise emit a
@@ -241,16 +243,24 @@ robot:
   # A hand that leaves the frame and comes back returns HOME and re-establishes
   # the basis, instead of continuing from a stale origin.
   #
-  # lost_frames is measured against the AI inference rate, NOT the camera rate:
-  # the hand branch runs at ~8 Hz, so one frame is ~125 ms. The palm/landmark
-  # cascade drops a frame now and then on a real hand (measured: bursts of 1-2
-  # misses, ~0.25 s, while the hand never actually left), and a threshold of 3
-  # sat right on top of that - a flicker was enough to declare "the hand left",
-  # yank the arm HOME and break the follow. 6 frames (~0.75 s) rides out the
-  # measured flicker while still reacting to a genuine exit in well under a
-  # second. Raise it if your lighting is worse; lower it if HOME feels sluggish.
+  # hand_lost_ms is a CONTINUOUS-absence window, in real milliseconds (not a
+  # frame count - the hand branch's rate wobbles between ~7.9 and ~8.9 fps, so a
+  # frame count does not mean a fixed amount of time). Any detection inside the
+  # window rewinds the clock, so an isolated flicker can never read as an exit.
+  #
+  # Why 2000 and not the earlier 6 frames (~750 ms): the palm/landmark cascade
+  # does not drop the occasional frame, it drops them in BURSTS. Measured on a
+  # live LRCP USB2.0 capture (2026-09-29): hand detections arrived in clusters of
+  # 4-10 frames separated by 0.9-19 s with nothing in between. 0.75 s sits inside
+  # that natural gap, so every cluster boundary read as a real exit - the arm was
+  # sent HOME 6 times in 2 minutes while the operator stood right in front of the
+  # camera. That is the "the arm barely moves" symptom. Raise it further if your
+  # lighting is worse; lower it if HOME feels sluggish.
+  #
+  # (This replaces the old `lost_frames: 6` key. A yaml still carrying that key
+  #  is ignored and the 2000 ms default applies.)
   home_on_presence: true
-  lost_frames: 6                # frames of absence before "the hand left"
+  hand_lost_ms: 2000            # continuous ms without detection before "the hand left"
 
   # ---- gesture mute window ------------------------------------------------
   # After a discrete gesture fires (gripper open/close, or home), continuous

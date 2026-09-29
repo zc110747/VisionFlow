@@ -74,7 +74,10 @@ ca::RobotConfig live_cfg() {
     c.home_on_presence = true;
     c.gesture_home = "off";
     c.gesture_gripper = true;
-    c.lost_frames = 2;
+    // Time-based departure window. This test drives frames 33 ms apart, so 60 ms
+    // means "the third consecutive miss is the departure" - the same shape the
+    // old `lost_frames = 2` produced, expressed in the units that now matter.
+    c.hand_lost_ms = 60;
     c.log_commands = true;
     return c;
 }
@@ -195,7 +198,9 @@ TEST(robot_live_backend_drives_sim_arm) {
     //     so the sequence must include a frame with the hand present again.
     ca::HandState none;
     none.detected = false;
-    for (int i = 0; i < cfg.lost_frames + 1; ++i) {
+    // 3 misses, 33 ms apart: the last one is 66 ms past the 60 ms window and is
+    // what registers the departure. The first two are still inside it.
+    for (int i = 0; i < 3; ++i) {
         link.update(none, 1200 + i * 33);
     }
     ASSERT(!link.hand_present());                      // departure registered

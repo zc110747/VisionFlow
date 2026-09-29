@@ -50,9 +50,9 @@ TEST(config_robot_gains_load_from_yaml) {
         std::ofstream f(path);
         f << "robot:\n";
         f << "  enable: true\n";
-        f << "  gain_x: 0.25\n";
+        f << "  gain_x: 0.4\n";
         f << "  gain_y: 0.5\n";
-        f << "  gain_z: 0.25\n";
+        f << "  gain_z: 0.4\n";
         f << "  reach_span_x: 39.0\n";
         f << "  reach_span_y: 176.0\n";
         f << "  reach_span_z: 41.5\n";
@@ -61,9 +61,9 @@ TEST(config_robot_gains_load_from_yaml) {
     ASSERT(ca::load_config(c, path));
 
     ASSERT(c.robot.enable);
-    ASSERT(std::fabs(c.robot.gain_x - 0.25f) < 1e-6f);
+    ASSERT(std::fabs(c.robot.gain_x - 0.40f) < 1e-6f);
     ASSERT(std::fabs(c.robot.gain_y - 0.50f) < 1e-6f);
-    ASSERT(std::fabs(c.robot.gain_z - 0.25f) < 1e-6f);
+    ASSERT(std::fabs(c.robot.gain_z - 0.40f) < 1e-6f);
     ASSERT(std::fabs(c.robot.reach_span_x - 39.0f) < 1e-6f);
     ASSERT(std::fabs(c.robot.reach_span_y - 176.0f) < 1e-6f);
     ASSERT(std::fabs(c.robot.reach_span_z - 41.5f) < 1e-6f);
@@ -72,9 +72,9 @@ TEST(config_robot_gains_load_from_yaml) {
     // deployment that loses the yaml file still gets the tuned feel rather than
     // the old jumpy 1:1.
     ca::Config d = ca::make_default_config();
-    ASSERT(std::fabs(d.robot.gain_x - 0.25f) < 1e-6f);
+    ASSERT(std::fabs(d.robot.gain_x - 0.40f) < 1e-6f);
     ASSERT(std::fabs(d.robot.gain_y - 0.50f) < 1e-6f);
-    ASSERT(std::fabs(d.robot.gain_z - 0.25f) < 1e-6f);
+    ASSERT(std::fabs(d.robot.gain_z - 0.40f) < 1e-6f);
 
     std::remove(path);
     return true;

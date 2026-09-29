@@ -175,6 +175,26 @@ private:
         R"("tcp": [120.03347742002852, -3.0000000000000004, 111.22362788339144], "device": "sim"}})";
 };
 
+// Parse the three components of the first delta array in a movexyz request.
+// Returns false when the array is absent or malformed, so a caller can walk a
+// request log without tripping over the caps/home payloads in it.
+bool parse_movexyz_delta(const std::string& req, float out[3]) {
+    const size_t lb = req.find('[');
+    if (lb == std::string::npos) return false;
+    size_t i = lb + 1;
+    for (int k = 0; k < 3; ++k) {
+        const size_t comma = req.find_first_of(",]", i);
+        if (comma == std::string::npos) return false;
+        try {
+            out[k] = std::stof(req.substr(i, comma - i));
+        } catch (...) {
+            return false;
+        }
+        i = comma + 1;
+    }
+    return true;
+}
+
 // Build a HandState that looks like a latched, detected hand.
 HandState make_hand() {
     HandState hs;
@@ -210,7 +230,10 @@ RobotConfig test_cfg() {
     c.gesture_home = "open_palm";
     c.gesture_gripper = true;
     c.home_on_presence = true;
-    c.lost_frames = 3;
+    // A short window so a test can cross it in a few frames. The tests below
+    // drive `update()` with explicit millisecond timestamps, so this is exact:
+    // 300 ms means "the third 100 ms step without a detection is the departure".
+    c.hand_lost_ms = 300;
     c.deadzone_mm = 0.5f;
     // Pin the gains to 1.0. The shipped defaults are tuned for feel (currently
     // 0.25/0.5/0.25 on this arm - see RobotConfig::gain_x) and a test that
@@ -669,8 +692,16 @@ TEST(robot_hand_leaves_then_returns_homes) {
     // Establishing the very first hand must not itself count as a "return".
     ASSERT_EQ(count_cmds(f.fp->requests, "\"home\""), homes_at_open);
 
-    // It leaves: `lost_frames` consecutive misses.
-    for (int i = 0; i < 3; ++i) f.link.update(make_no_hand(), 1100 + i * 100);
+    // It leaves: `hand_lost_ms` of CONTINUOUS absence. The last detection was at
+    // t=1000, so t=1100 and t=1200 are only 100/200 ms of silence - below the
+    // 300 ms window - and must NOT count yet. Only t=1300 crosses it. That
+    // asymmetry is the point of the time-based rule: a short gap is a flicker,
+    // not an exit.
+    f.link.update(make_no_hand(), 1100);
+    ASSERT(f.link.hand_present());
+    f.link.update(make_no_hand(), 1200);
+    ASSERT(f.link.hand_present());
+    f.link.update(make_no_hand(), 1300);
     ASSERT(!f.link.hand_present());
     ASSERT(f.link.hand_was_away());
 
@@ -681,6 +712,54 @@ TEST(robot_hand_leaves_then_returns_homes) {
     ASSERT_EQ(count_cmds(f.fp->requests, "\"home\""), homes_at_open + 1);
     ASSERT(f.link.hand_present());
     ASSERT(!f.link.hand_was_away());
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ㉔ The bursty-detector regression: the 2026-09-29 operator report, written
+//    down as a test. On a live camera the palm/landmark cascade does NOT return
+//    a steady stream - it returns CLUSTERS of 4-10 detected frames separated by
+//    gaps of 0.9-19 s (measured). Under the old frame-count rule a gap crossing
+//    `lost_frames` = 6 (~0.75 s at the hand branch's ~8 Hz) made every cluster
+//    boundary look like a real exit, so the arm was yanked HOME between clusters
+//    and barely followed the hand at all.
+//
+//    The fixture's window is 300 ms, so the 200 ms silence below stands in for
+//    the measured sub-second inter-cluster gaps against the shipped 2000 ms.
+//    The assertions are on the `home` COUNT and on presence - "the link stayed
+//    up" is not the claim being made here.
+// ---------------------------------------------------------------------------
+TEST(robot_short_detection_gap_does_not_home) {
+    Fixture f(test_cfg());
+    ASSERT(f.link.connect_if_needed());
+    const int homes_at_open = count_cmds(f.fp->requests, "\"home\"");
+
+    // Cluster 1: the hand is found and steered.
+    HandState hs = make_hand();
+    hs.delta = Vec3{0.02f, 0.0f, 0.0f};
+    f.link.update(hs, 1000);
+    ASSERT(f.link.hand_present());
+
+    // The gap. 200 ms is INSIDE the 300 ms window, so the hand must still count
+    // as present at every one of these frames.
+    f.link.update(make_no_hand(), 1100);
+    ASSERT(f.link.hand_present());
+    f.link.update(make_no_hand(), 1200);
+    ASSERT(f.link.hand_present());
+    ASSERT(!f.link.hand_was_away());
+
+    // Cluster 2: the hand was never gone, so this is a CONTINUATION - no HOME,
+    // and the follow is unbroken.
+    HandState again = make_hand();
+    again.delta = Vec3{0.04f, 0.0f, 0.0f};
+    f.link.update(again, 1250);
+    ASSERT(f.link.hand_present());
+    ASSERT_EQ(count_cmds(f.fp->requests, "\"home\""), homes_at_open);
+
+    // The converse still holds: a silence that DOES exceed the window is an exit.
+    f.link.update(make_no_hand(), 1600);   // 350 ms since the t=1250 detection
+    ASSERT(!f.link.hand_present());
+    ASSERT(f.link.hand_was_away());
     return true;
 }
 
@@ -697,7 +776,9 @@ TEST(robot_home_on_return_can_be_disabled) {
     HandState hs = make_hand();
     hs.delta = Vec3{0.02f, 0.0f, 0.0f};
     f.link.update(hs, 1000);   // establish presence
+    // Same 300 ms continuous-absence window as test ⑪ (t=1300 is the crossing).
     for (int i = 0; i < 3; ++i) f.link.update(make_no_hand(), 1100 + i * 100);
+    ASSERT(!f.link.hand_present());
 
     HandState back = make_hand();
     back.delta = Vec3{0.02f, 0.0f, 0.0f};
@@ -983,6 +1064,220 @@ TEST(robot_soft_boundary_quiets_the_wall) {
 }
 
 // ---------------------------------------------------------------------------
+// ⑰b A pinned axis must not freeze the other two.
+//
+//     The suppression used to be all-or-nothing: the first axis found pressed
+//     against its bound ended the whole frame, so once the arm parked on one
+//     wall it stopped responding on ALL of them. On this arm that is not a
+//     corner case - at HOME X has 9 mm of travel left and Z has 5 mm - so the
+//     operator's "the hand moves and the arm does not" showed up almost
+//     immediately. The zeroing must therefore be confined to the pinned axis.
+//
+//     The frame here pushes +x (into the wall) AND +z (mid-range, free) at the
+//     same time, with the arm parked on the +x bound: the x component must
+//     vanish, the z component must survive, and the frame must still be SENT.
+// ---------------------------------------------------------------------------
+TEST(robot_soft_boundary_suppresses_only_the_pinned_axis) {
+    RobotConfig cfg = test_cfg();
+    cfg.soft_boundary = true;
+    cfg.soft_margin = 0.20f;
+    Fixture f(cfg);
+    ASSERT(f.link.connect_if_needed());
+
+    const RobotCaps& c = f.link.caps();
+    // The arm is reported at the +x wall, but z at mid-range (plenty of room).
+    f.fp->report_movexyz_tcp_ = true;
+    f.fp->movexyz_tcp_[0] = c.ws_max[0];
+    f.fp->movexyz_tcp_[1] = 0.0f;
+    f.fp->movexyz_tcp_[2] = (c.ws_min[2] + c.ws_max[2]) * 0.5f;
+
+    // Presence frame (consumed by the presence rule, emits nothing).
+    HandState warm = make_hand();
+    warm.delta = Vec3{0.0f, 0.0f, 0.0f};
+    f.link.update(warm, 900);
+
+    // Frame 1: +x only, so the reported `tcp` latches as the wall position.
+    // (Hand +y -> arm +x; hand +z -> arm +z. Before this frame there is no
+    // commanded position at all, so the taper reads HOME and does not bite.)
+    HandState p1 = make_hand();
+    p1.delta = Vec3{0.0f, 0.10f, 0.0f};
+    f.link.update(p1, 1000);
+
+    // Frames 2-4: keep pushing +x INTO the wall while ALSO moving +z. Each frame
+    // carries a fresh increment (HandState::delta is cumulative, so repeating a
+    // value means "the hand is still", not "keep moving").
+    for (int i = 1; i <= 3; ++i) {
+        HandState p = make_hand();
+        p.delta = Vec3{0.0f, 0.10f * (i + 1), 0.10f * i};
+        f.link.update(p, 1000 + i * 100);
+    }
+
+    // Nothing may have been refused: the pinned axis is dropped locally instead
+    // of being ground against the server.
+    ASSERT_EQ(f.link.commands_rejected(), 0);
+
+    // Walk the request log: the x component must have been live BEFORE the wall
+    // was reached and must be gone after, while z keeps being sent.
+    int    movexyz_count = 0;
+    bool   saw_live_x    = false;
+    float  last[3]       = {0.0f, 0.0f, 0.0f};
+    for (const std::string& cmd : f.fp->requests) {
+        if (cmd.find("movexyz") == std::string::npos) continue;
+        float d[3];
+        if (!parse_movexyz_delta(cmd, d)) continue;
+        ++movexyz_count;
+        if (std::fabs(d[0]) > 10.0f) saw_live_x = true;
+        last[0] = d[0];
+        last[1] = d[1];
+        last[2] = d[2];
+    }
+
+    // The frame was never frozen: the arm kept being commanded after the park.
+    ASSERT(movexyz_count >= 3);
+    // ...and the x axis really was working before it hit the wall, so the zero
+    // below is the boundary talking and not a dead axis.
+    ASSERT(saw_live_x);
+
+    // The pinned axis is dropped, the free axis is untouched.
+    ASSERT(std::fabs(last[0]) < 0.01f);
+    ASSERT(std::fabs(last[2]) > 1.0f);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ⑰c A refusal must not pull the learned bound onto the arm's own pose.
+//
+//     learn_from_rejection() used to write `min(from + step, from)` - the
+//     arm's CURRENT position - on the theory that "the step was refused, so the
+//     arm is still at `from` and the extreme is at most `from`". That leaves the
+//     arm standing exactly ON its wall, where the taper reads d == 0 and returns
+//     the 0.10 floor for every outward step, AND relax_learned_bound()'s
+//     `v > eff_max_` test can never hold (the arm cannot get past a bound that is
+//     drawn through its own position). So one refusal closes that side of that
+//     axis for the rest of the session, silently.
+//
+//     This is the mechanism behind the 2026-09-29 live report ("moving the hand
+//     barely moves the arm"). In that 35-minute run the Y and Z taper weights
+//     were pinned at the floor in 300/1370 and 362/1370 of the taper frames,
+//     every one of them with the arm parked at HOME - +Y and +Z were shut while
+//     the hand was still being tracked. The backend did not even need to blame
+//     the right axis: it refuses the WHOLE command when ANY one axis leaves the
+//     solvable set, so a +Z limit also tightened Y.
+//
+//     A refusal of `from + step` proves that TARGET is unreachable. It proves
+//     nothing about the interval between `from` and the target. The bound
+//     belongs at the target - one headroom step out - so the arm keeps its full
+//     range minus one step, and each further refusal re-tightens by exactly the
+//     step it was asked for.
+// ---------------------------------------------------------------------------
+TEST(robot_rejection_leaves_headroom_at_the_current_pose) {
+    RobotConfig cfg = test_cfg();
+    cfg.soft_boundary = true;
+    cfg.soft_probe_on_reject = false;    // the refusal must reach the learner raw
+    cfg.reach_span_x = 60.0f;            // a 60 mm X axis: 120 mm of hand travel
+    cfg.reach_span_y = 176.0f;
+    cfg.reach_span_z = 42.0f;
+    Fixture f(cfg);
+    ASSERT(f.link.connect_if_needed());
+
+    // The reported `tcp` is pinned, so `from` is a known constant and the only
+    // thing that moves across the next two frames is the learned bound.
+    f.fp->report_movexyz_tcp_ = true;
+    f.fp->movexyz_tcp_[0] = 115.033f;
+    f.fp->movexyz_tcp_[1] = 0.0f;
+    f.fp->movexyz_tcp_[2] = 109.224f;
+    // A magnitude wall, which is the shape the real JOINT_LIMIT has near an edge:
+    // 0.30 of hand travel -> 0.30 * 60/0.5 = 36 mm, refused; the same motion
+    // short enough would have gone through.
+    f.fp->reject_movexyz_above_mm_ = 15.0f;
+
+    HandState warm = make_hand();
+    warm.delta = Vec3{0.0f, 0.0f, 0.0f};
+    f.link.update(warm, 900);            // first frame: latches the delta basis only
+
+    HandState push = make_hand();
+    push.delta = Vec3{0.0f, 0.13f, 0.0f};   // 0.13 * 120 = 15.6 mm, over the wall
+    f.link.update(push, 1000);              // refused -> the learner runs
+
+    ASSERT(f.link.commands_rejected() >= 1);
+
+    const float at[3] = {115.033f, 0.0f, 109.224f};
+    // THE INVARIANT: at the pose the refusal came from, outward travel is still
+    // available. Pinning the bound to this pose would leave exactly zero.
+    ASSERT(!f.link.push_out_of_bound(at, 0, +5.0f));
+    ASSERT(f.link.boundary_weight(at, 0, +1.0f) > 0.999f);
+
+    // Control: a step that really does overshoot the attempted target is still
+    // caught, so this is headroom and not "the learner stopped learning".
+    // 115.033 + 15.6 = 130.633 was the refused target; 25 mm clears it.
+    ASSERT(f.link.push_out_of_bound(at, 0, +25.0f));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ⑰d ...and the bound a refusal did pull in has to EXPIRE.
+//
+//     ⑰c puts the bound one step out, which is right, but a single refusal is
+//     still only evidence about one point on a face of the reachable shell - and
+//     on this backend it may not even be about the axis it moved. So the bound
+//     drifts back out toward its prior band (the measured span, never the caps
+//     box) a little on every accepted command.
+//
+//     Without the drift the bound is a one-way ratchet: each refusal walks the
+//     arm's usable range in by a step and nothing ever gives it back, which is
+//     the same permanent squeeze the `min(from+step, from)` write caused - just
+//     arriving one step per refusal instead of all at once.
+// ---------------------------------------------------------------------------
+TEST(robot_learned_bound_decays_back_toward_the_prior_band) {
+    RobotConfig cfg = test_cfg();
+    cfg.soft_boundary = true;
+    cfg.soft_probe_on_reject = false;
+    cfg.reach_span_x = 60.0f;            // prior band = HOME +/- 30 mm
+    cfg.reach_span_y = 176.0f;
+    cfg.reach_span_z = 42.0f;
+    Fixture f(cfg);
+    ASSERT(f.link.connect_if_needed());
+
+    f.fp->report_movexyz_tcp_ = true;
+    f.fp->movexyz_tcp_[0] = 115.033f;
+    f.fp->movexyz_tcp_[1] = 0.0f;
+    f.fp->movexyz_tcp_[2] = 109.224f;
+    f.fp->reject_movexyz_above_mm_ = 15.0f;
+
+    HandState warm = make_hand();
+    warm.delta = Vec3{0.0f, 0.0f, 0.0f};
+    f.link.update(warm, 900);
+
+    // One refused +x step puts the bound at 115.033 + 15.6 = 130.633, which is
+    // INSIDE the 145.033 prior edge, so there is room for the drift to open.
+    HandState push = make_hand();
+    push.delta = Vec3{0.0f, 0.13f, 0.0f};
+    f.link.update(push, 1000);
+    ASSERT(f.link.commands_rejected() >= 1);
+
+    const float at[3] = {115.033f, 0.0f, 109.224f};
+    // +20 mm lands at 135.033: past the fresh bound, inside the prior edge.
+    ASSERT(f.link.push_out_of_bound(at, 0, +20.0f));
+
+    // Now drive the arm INWARD, which is always untapered, so every frame is an
+    // accepted command and therefore a relax tick credit. -0.05 of hand travel
+    // is 6 mm, comfortably under the fake's 15 mm wall, and the hand offset only
+    // ever needs 48 * 0.05 = 2.4 of travel to bank the 6 ticks below.
+    const int kFrames = 48;
+    for (int i = 0; i < kFrames; ++i) {
+        HandState back = make_hand();
+        back.delta = Vec3{0.0f, 0.13f - 0.05f * static_cast<float>(i + 1), 0.0f};
+        f.link.update(back, 1100 + static_cast<int64_t>(i) * 100);
+    }
+
+    // 48 acceptances = 6 relax ticks at kRelaxEveryNAccepts = 8, each moving the
+    // bound 10% of the remaining gap: 130.633 -> ~137.4, so the same +20 mm step
+    // is inside again. The direction is what matters, not the exact millimetre.
+    ASSERT(!f.link.push_out_of_bound(at, 0, +20.0f));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // ⑱ Soft boundary OFF must reproduce the old behaviour exactly - the same
 //    command as before the feature existed. This is the regression guard: it is
 //    what makes "just turn it off" a real escape hatch.
@@ -1158,11 +1453,11 @@ TEST(robot_soft_probe_recovers_a_halved_step) {
     for (int i = 1; i <= 3; ++i) f.link.update(push, 1000 + i * 100);
     const int64_t sent_after = f.link.commands_sent();
 
-    // The following frames go quiet instead of repeating the exchange: the
-    // refusal taught the learner that the bound is at the arm's current
-    // position, so the outward step is suppressed outright (that suppression is
-    // what robot_soft_boundary_quiets_the_wall pins down). Requiring "keeps
-    // sending" here would demand the feature NOT work.
+    // The following frames send nothing: `push.delta` is unchanged, and
+    // HandState::delta is CUMULATIVE, so the increment against the previous
+    // frame is zero and the frame is gobbled by the deadzone. (Not a claim about
+    // the learnt bound - the probe accepted, so the learner never even saw this
+    // refusal; its own tests are ⑰c/⑰d below.)
     ASSERT(sent_after == sent_mid);
 
     // And the accepted traffic is SMALLER than the refused first attempt: the
@@ -1229,7 +1524,8 @@ TEST(robot_soft_probe_off_sends_only_the_original_step) {
 //    it exists so that retuning the arm's responsiveness is a conscious edit
 //    with a failing test attached, rather than a number someone nudges and
 //    forgets. The operator asked for "hand moves big, arm moves small" after
-//    finding the near-1:1 response too jumpy (2026-09-29).
+//    finding the near-1:1 response too jumpy, then asked for a LONGER reach
+//    after living with 0.25 on X/Z (2026-09-29, two passes).
 //
 //    If this fails because you MEANT to retune: update the yaml, config.h and
 //    these numbers together, and re-check the jitter arithmetic in the comment
@@ -1240,16 +1536,22 @@ TEST(robot_soft_probe_off_sends_only_the_original_step) {
 //    (0.02 normalised - the smallest hand movement that yields a delta):
 //
 //      axis  span(mm)  gain   mm per 0.02    vs the 0.5 mm minimum step
-//      X       39.0    0.25       0.39        filtered (tremor rejected)
-//      Y      176.0    0.50       1.76        passes
-//      Z       41.5    0.25       0.42        filtered (tremor rejected)
+//      X       39.0    0.40       0.62        JUST above -> reaches the arm
+//      Y      176.0    0.50       3.52        passes
+//      Z       41.5    0.40       0.66        JUST above -> reaches the arm
+//
+//    The X/Z lines are the documented cost of the 0.25 -> 0.4 raise: at 0.25
+//    their tremor was 0.39-0.42 mm and the floor filtered it; at 0.4 it is
+//    0.62-0.66 mm and it gets through. The test asserts the new truth rather
+//    than the old one, so a future "why does it buzz" question has an answer
+//    in the diff instead of an archaeology session.
 // ---------------------------------------------------------------------------
 TEST(robot_shipped_gains_are_the_documented_feel) {
     const RobotConfig def;
 
-    ASSERT(std::fabs(def.gain_x - 0.25f) < 1e-6f);
+    ASSERT(std::fabs(def.gain_x - 0.40f) < 1e-6f);
     ASSERT(std::fabs(def.gain_y - 0.50f) < 1e-6f);
-    ASSERT(std::fabs(def.gain_z - 0.25f) < 1e-6f);
+    ASSERT(std::fabs(def.gain_z - 0.40f) < 1e-6f);
 
     // The spans those gains are read against. Kept here so the mm-per-unit
     // arithmetic above is checkable rather than folklore.
@@ -1257,18 +1559,20 @@ TEST(robot_shipped_gains_are_the_documented_feel) {
     ASSERT(std::fabs(def.reach_span_y - 176.0f) < 1e-6f);
     ASSERT(std::fabs(def.reach_span_z - 41.5f) < 1e-6f);
 
-    // The two "jitter is filtered" claims, stated as arithmetic against the
-    // effective floor (kMinDeltaMm, mirrored here at 0.5). X and Z must land
-    // UNDER it and Y must stay over it, or the tuned feel is not what shipped.
+    // The jitter claim, stated as arithmetic against the effective floor
+    // (kMinDeltaMm, mirrored here at 0.5). At 0.4 X and Z sit just ABOVE the
+    // floor - that is the deliberate trade for reach, and the margin is
+    // asserted so a later tweak that silently re-filters them (or blows them
+    // far past it) shows up here.
     const float jitter = 0.02f;             // HandConfig::motion_deadzone
     const float span_over_active = 1.0f / 0.5f;  // axis_scale divisor
     const float step_x = span_over_active * def.reach_span_x * def.gain_x * jitter;
     const float step_y = span_over_active * def.reach_span_y * def.gain_y * jitter;
     const float step_z = span_over_active * def.reach_span_z * def.gain_z * jitter;
 
-    ASSERT(step_x < 0.5f);
-    ASSERT(step_z < 0.5f);
-    ASSERT(step_y > 0.5f);
+    ASSERT(step_x > 0.5f && step_x < 1.0f);
+    ASSERT(step_z > 0.5f && step_z < 1.0f);
+    ASSERT(step_y > 3.0f);
 
     // And the user-facing statement: a typical deliberate move (0.10) must still
     // produce a visible step on every axis, or the arm feels broken.

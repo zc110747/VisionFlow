@@ -1,0 +1,3 @@
+[ws] connected ws://127.0.0.1:8090/ws/joint (read-only subscriber)
+[ws] 50 frames
+[ws] done: 70 frames -> joint_stream.jsonl

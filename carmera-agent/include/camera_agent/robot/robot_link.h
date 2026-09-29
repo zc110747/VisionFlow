@@ -167,6 +167,13 @@ public:
     // The configured measured span (mm) for one axis; 0 when unset.
     float measured_span(int axis) const;
 
+    // The band the taper runs against before anything has been learned: the
+    // measured span centred on the caps home pose, or the caps box when no span
+    // is configured. Identical to effective_bounds()' non-learned branch, so the
+    // learned bounds can relax back to exactly this and "relaxed all the way
+    // back" stays indistinguishable from "nothing learned yet".
+    void prior_bounds(int axis, float& lo_out, float& hi_out) const;
+
     // --- introspection (for logs and tests) --------------------------------
     const RobotCaps& caps() const { return caps_; }
     bool  connected() const { return client_ && client_->connected(); }
@@ -199,8 +206,16 @@ private:
 
     // Soft-boundary bound learning. `from_mm` is the position the refused step
     // started at and `step_mm` the step that was rejected.
+    //
+    // The learned bound is placed at the ATTEMPTED TARGET (`from + step`), never
+    // at `from`. Pinning it to the arm's own pose leaves the arm sitting exactly
+    // on the wall, where the taper is at its floor and relaxation can never fire
+    // - a permanent loss of that side of the axis. See the long comment in the
+    // .cpp for the measured instance of this.
     void learn_from_rejection(const float from_mm[3], const float step_mm[3]);
-    // An accepted step tells us where the arm actually got to.
+    // An accepted step tells us where the arm actually got to, AND lets every
+    // learned bound drift back toward its prior band. The drift is what stops a
+    // single refusal from closing an axis for the rest of the session.
     void relax_learned_bound(const float reached_mm[3]);
 
     // Returns true when the reply means "this frame needs no command".
@@ -277,6 +292,12 @@ private:
     //
     // The pair starts at the caps box and only ever moves inward first, so with
     // no refusals at all the behaviour is exactly the caps-based one.
+    //
+    // The pull-in is NOT permanent. Every kRelaxEveryNAccepts accepted commands
+    // each side drifts kRelaxToPriorFraction of the way back toward the axis'
+    // prior band (prior_bounds()), so a bound learned from one refusal - possibly
+    // one caused by a DIFFERENT axis, since the backend refuses the whole command
+    // - expires instead of closing that direction for the rest of the session.
     float eff_min_[3] = {0, 0, 0};
     float eff_max_[3] = {0, 0, 0};
     bool  eff_init_ = false;
@@ -295,6 +316,17 @@ private:
     // the very first hand of a session would look like a "return" and trigger a
     // redundant HOME right after open() already sent one.
     bool    presence_established_ = false;
+    // Worker-clock timestamp of the last frame that DETECTED a hand. The
+    // departure test is `now_ms - last_seen_ms_ >= cfg_.hand_lost_ms`, i.e. a
+    // CONTINUOUS absence - any detection in between rewinds the clock, which is
+    // what makes a flicker harmless. 0 means "never seen yet", which keeps the
+    // test false so an absent-from-the-start session cannot fire a spurious
+    // departure (and `hand_seen_` is false then anyway).
+    //
+    // Deliberately a timestamp, not a frame counter: see RobotConfig::hand_lost_ms
+    // for the measured reason (detections come in bursts, and the frame rate is
+    // not constant enough for a frame count to mean a fixed amount of time).
+    int64_t last_seen_ms_ = 0;
     int     miss_streak_ = 0;
     int64_t backoff_until_ms_ = 0;
     int64_t next_connect_attempt_ms_ = 0;

@@ -292,7 +292,9 @@ ca::RobotConfig test_cfg() {
     c.home_on_presence = true;
     c.gesture_home = "off";    // keep open_palm free: this sequence uses fist
     c.gesture_gripper = true;
-    c.lost_frames = 2;
+    // Departure window, in real ms (was `lost_frames = 2`). This test never
+    // feeds a hand-less frame, so the value only has to be a sane one.
+    c.hand_lost_ms = 250;
     return c;
 }
 

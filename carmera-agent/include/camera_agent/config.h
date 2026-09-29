@@ -64,15 +64,22 @@ struct RobotConfig {
     //
     // The effective gain is `gain_axis * reach_span_axis / 0.5`. Values below
     // 1.0 make the arm move LESS than the hand, which is how hand-tracking
-    // jitter is kept out of the arm. Tuned live on 2026-09-29: the near-1:1
-    // response was too jumpy, and dropping X/Z to 0.25 puts their per-frame
-    // jitter (a 0.02-normalised hand tremor, the analyzer's motion_deadzone)
-    // under the 0.5 mm minimum step, so it is filtered rather than acted on.
+    // jitter is kept out of the arm. Retuned live on 2026-09-29 in two steps:
+    // near-1:1 was too jumpy, X/Z went to 0.25, and then the operator found the
+    // reach still too short and asked for 0.4.
+    //
+    // The 0.25 -> 0.4 step is a deliberate trade and not a free win. At 0.25 an
+    // X/Z per-frame tremor (a 0.02-normalised hand wobble, the analyzer's
+    // motion_deadzone) landed at 0.39-0.42 mm - UNDER the 0.5 mm minimum step,
+    // so it was filtered. At 0.4 the same tremor is 0.62-0.66 mm: above the
+    // floor, so it now reaches the arm as a small move. Bigger hand travel buys
+    // proportionally bigger arm travel (0.10-normalised: 1.95 -> 3.12 mm on X),
+    // which is what "the reach is too short" actually asked for.
     // Y stays at 0.5 because its span is 4.5x X's - the raw numbers are not
     // comparable across axes, only their mm-per-normalised-unit products are.
-    float gain_x = 0.25f;
+    float gain_x = 0.4f;
     float gain_y = 0.5f;
-    float gain_z = 0.25f;
+    float gain_z = 0.4f;
 
     // Below this the command is skipped rather than sent. MeArmPilot rejects an
     // all-zero vector as a parameter error, and hand tremor would otherwise
@@ -157,17 +164,31 @@ struct RobotConfig {
     // rule; setting it false keeps the arm wherever it was.
     bool home_on_presence = true;
 
-    // Frames a hand must be absent before it counts as "left". The HandAnalyzer
-    // already resets its own reference after `lost_frames_to_reset`, and this
-    // gives the robot side an independent, configurable reaction point.
+    // Milliseconds a hand must be CONTINUOUSLY absent before it counts as
+    // "left". Any detection inside the window resets the clock, so an isolated
+    // flicker can never read as an exit.
     //
-    // Measured against the AI inference rate (the hand branch runs ~8 Hz, so a
-    // frame is ~125 ms), NOT the camera rate. The cascade drops the occasional
-    // frame on a real hand: on a live LRCP USB2.0 capture the misses came in
-    // bursts of 1-2 frames (~0.25 s) while the hand never left the view. The
-    // old value of 3 sat on top of that, so a flicker read as a real exit,
-    // returned the arm HOME and broke the follow. 6 rides out the burst.
-    int lost_frames = 6;
+    // Wall clock, not frames, on purpose. The hand branch nominally runs ~8 Hz
+    // but the measured rate wobbles (7.9-8.9 fps observed live), and a frame
+    // count silently re-scales to a different amount of time whenever the
+    // pipeline is loaded - it also cannot express what the operator actually
+    // asked for ("two seconds").
+    //
+    // Why 2000 and not the earlier 6 frames (~750 ms): the cascade does not drop
+    // the OCCASIONAL frame, it drops them in BURSTS. Measured on a live LRCP
+    // USB2.0 capture (2026-09-29): hand detections arrived in clusters of 4-10
+    // frames separated by 0.9-19 s with nothing in between. A 6-frame threshold
+    // sits inside that natural inter-cluster gap, so every cluster boundary read
+    // as a real exit - the arm was sent HOME 6 times in 2 minutes while the
+    // operator stood right in front of the camera, which IS the "movement is
+    // crippled" symptom. A continuous 2 s window rides out the gap.
+    //
+    // The HandAnalyzer's own `lost_frames_to_reset` (10 frames, ~1.25 s) is a
+    // DIFFERENT thing and deliberately stays shorter: it only re-latches the
+    // delta reference so a returning hand cannot emit one huge jump. Since it is
+    // shorter than this window, coming back inside 2 s costs nothing - the arm
+    // just keeps following.
+    int hand_lost_ms = 2000;
 
     // --- gesture mute window -------------------------------------------------
     // After a discrete gesture fires (gripper open/close, or home), continuous

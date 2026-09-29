@@ -1,0 +1,188 @@
+HELLO: {
+ "version": 1,
+ "type": "hello",
+ "timestamp": 1790685052688,
+ "model": {
+  "id": "mearm",
+  "name": "mARM",
+  "source": "E:\\cnb\\git\\MeArmPilot\\MeArm-3D\\robot-package\\mearm-v1\\model\\robot.yaml",
+  "jointOrder": [
+   "base",
+   "shoulder",
+   "elbow",
+   "gripper"
+  ],
+  "limits": [
+   {
+    "id": "base",
+    "role": "base",
+    "min": -60,
+    "max": 60
+   },
+   {
+    "id": "shoulder",
+    "role": "shoulder",
+    "min": -6.0936827341,
+    "max": 49.454929245
+   },
+   {
+    "id": "elbow",
+    "role": "elbow",
+    "min": 108.4414852068,
+    "max": 141.8582211436
+   },
+   {
+    "id": "gripper",
+    "role": "gripper",
+    "min": 10,
+    "max": 100
+   }
+  ],
+  "calibration": [
+   {
+    "jointId": "base",
+    "servoId": "servo_9",
+    "channel": 9,
+    "offset": 90,
+    "scale": 1,
+    "reverse": false,
+    "servoLo": 30,
+    "servoHi": 150
+   },
+   {
+    "jointId": "shoulder",
+    "servoId": "servo_7",
+    "channel": 7,
+    "offset": 88.776,
+    "scale": 1.44018,
+    "reverse": false,
+    "servoLo": 80.00000000000387,
+    "servoHi": 160.00000000006412
+   },
+   {
+    "jointId": "elbow",
+    "servoId": "servo_8",
+    "channel": 8,
+    "offset": 359.61,
+    "scale": 2.39401,
+    "reverse": true,
+    "servoLo": 20.000000000010175,
+    "servoHi": 100.00000000006872
+   },
+   {
+    "jointId": "gripper",
+    "servoId": "servo_6",
+    "channel": 6,
+    "offset": 140,
+    "scale": 1,
+    "reverse": true,
+    "servoLo": 40,
+    "servoHi": 130
+   }
+  ],
+  "homePose": {
+   "base": 0,
+   "elbow": 112.6185771989,
+   "gripper": 50,
+   "shoulder": 0.8498937633
+  }
+ },
+ "device": "serial",
+ "simulation_mode": "real"
+}
+JOINT_STATE: {"version":1,"type":"joint_state","timestamp":1790685052688,"joints":{"base":3,"elbow":112.62,"gripper":50,"shoulder":0.85},"origin":"command"}
+HELLO: {
+ "version": 1,
+ "type": "hello",
+ "timestamp": 1790685052691,
+ "model": {
+  "id": "mearm",
+  "name": "mARM",
+  "source": "E:\\cnb\\git\\MeArmPilot\\MeArm-3D\\robot-package\\mearm-v1\\model\\robot.yaml",
+  "jointOrder": [
+   "base",
+   "shoulder",
+   "elbow",
+   "gripper"
+  ],
+  "limits": [
+   {
+    "id": "base",
+    "role": "base",
+    "min": -60,
+    "max": 60
+   },
+   {
+    "id": "shoulder",
+    "role": "shoulder",
+    "min": -6.0936827341,
+    "max": 49.454929245
+   },
+   {
+    "id": "elbow",
+    "role": "elbow",
+    "min": 108.4414852068,
+    "max": 141.8582211436
+   },
+   {
+    "id": "gripper",
+    "role": "gripper",
+    "min": 10,
+    "max": 100
+   }
+  ],
+  "calibration": [
+   {
+    "jointId": "base",
+    "servoId": "servo_9",
+    "channel": 9,
+    "offset": 90,
+    "scale": 1,
+    "reverse": false,
+    "servoLo": 30,
+    "servoHi": 150
+   },
+   {
+    "jointId": "shoulder",
+    "servoId": "servo_7",
+    "channel": 7,
+    "offset": 88.776,
+    "scale": 1.44018,
+    "reverse": false,
+    "servoLo": 80.00000000000387,
+    "servoHi": 160.00000000006412
+   },
+   {
+    "jointId": "elbow",
+    "servoId": "servo_8",
+    "channel": 8,
+    "offset": 359.61,
+    "scale": 2.39401,
+    "reverse": true,
+    "servoLo": 20.000000000010175,
+    "servoHi": 100.00000000006872
+   },
+   {
+    "jointId": "gripper",
+    "servoId": "servo_6",
+    "channel": 6,
+    "offset": 140,
+    "scale": 1,
+    "reverse": true,
+    "servoLo": 40,
+    "servoHi": 130
+   }
+  ],
+  "homePose": {
+   "base": 0,
+   "elbow": 112.6185771989,
+   "gripper": 50,
+   "shoulder": 0.8498937633
+  }
+ },
+ "device": "serial",
+ "simulation_mode": "real"
+}
+JOINT_STATE: {"version":1,"type":"joint_state","timestamp":1790685052691,"joints":{"base":3,"elbow":112.62,"gripper":50,"shoulder":0.85},"origin":"command"}
+DEVICE_STATUS: {"version":1,"type":"device_status","timestamp":1790685052691,"device":"serial","connected":true}
+frames_seen=2

@@ -142,7 +142,22 @@ constexpr float kBoundLearnMinStepMm = 0.5f;
 // out, so the learned bound only relaxes after this many consecutive
 // acceptances - and then only part of the way (kRelaxFraction).
 constexpr int   kRelaxEveryNAccepts = 8;
+
+// Snap-back distance when the arm has just been PROVED to be somewhere beyond
+// the bound (the arm reached `v > eff_max_`, so eff_max_ was too tight).
 constexpr float kRelaxFraction = 0.25f;
+
+// Drift-back distance, applied on the same tick, toward the axis' prior band
+// even when nothing has been proved. This is what gives a learned bound a
+// half-life. Without it a bound pulled in by a single refusal is permanent: a
+// bound pinned to the arm's own pose leaves the arm sitting exactly ON the wall,
+// where `v > eff_max_` can never hold, so kRelaxFraction never fires at all.
+//
+// Deliberately gentler than kRelaxFraction: a real wall re-learns itself within
+// a few frames (the taper decelerates into it, and a refusal plus the halving
+// probe is cheap), whereas a wrong wall costs entire axes for the whole session.
+// 0.10 per 8 acceptances is a time constant of ~80 accepted frames.
+constexpr float kRelaxToPriorFraction = 0.10f;
 
 // Tolerance for "this step would leave the learned bound". A step that lands
 // exactly on the bound is fine (that is the extreme of the reachable set); only
@@ -693,6 +708,24 @@ float RobotLink::measured_span(int axis) const {
     }
 }
 
+// The band the taper runs against BEFORE anything has been learned, exposed so
+// the learned bounds can relax back to exactly this and no further.
+//
+// Kept identical to effective_bounds()' non-learned branch on purpose: "relaxed
+// all the way back" and "nothing learned yet" must mean the same thing, or the
+// learner would have a second, invisible set of bounds to disagree with.
+void RobotLink::prior_bounds(int axis, float& lo_out, float& hi_out) const {
+    const float measured = measured_span(axis);
+    if (measured > 0.0f && caps_.home_valid) {
+        const float h = caps_.home_tcp[axis];
+        lo_out = h - measured * 0.5f;
+        hi_out = h + measured * 0.5f;
+        return;
+    }
+    lo_out = caps_.ws_min[axis];
+    hi_out = caps_.ws_max[axis];
+}
+
 float RobotLink::boundary_weight(const float pos_mm[3], int axis, float step_mm) const {
     // Off, unknown geometry, or a degenerate span: no taper at all. Returning 1
     // (rather than 0) keeps the caller's arithmetic identical to the original
@@ -769,17 +802,31 @@ void RobotLink::learn_from_rejection(const float from_mm[3], const float step_mm
     // axis' bound, and tightening it there would walk the bound in for free.
     for (int a = 0; a < 3; ++a) {
         if (step_mm[a] > kBoundLearnMinStepMm) {
-            // The arm could not get to `from + step`, so the bound is at most
-            // that. But the useful statement is tighter than that: the arm is
-            // still AT `from` (the step was refused), so the reachable extreme is
-            // at most `from` - the target only bounds it from above. Using
-            // `from + step` writes a bound the arm demonstrably cannot reach,
-            // which then keeps the taper loose for another whole step and costs
-            // exactly one extra refusal every time.
-            const float bound = std::min(from_mm[a] + step_mm[a], from_mm[a]);
+            // A refusal of `from + step` proves the arm cannot REACH that
+            // target, so the bound is at most there. It does NOT prove the arm
+            // has run out of travel: every point strictly between `from` and
+            // `from + step` is still untested.
+            //
+            // This used to write `min(from + step, from)` - pinning the bound to
+            // the arm's CURRENT pose - on the theory that the arm "is still at
+            // from, so the extreme is at most from". That is the deadlock
+            // measured on 2026-09-29. Pinning to the current pose puts the arm
+            // exactly ON the wall, where d == 0 and boundary_weight() returns the
+            // 0.10 floor for every outward step; and with the arm sitting on the
+            // bound, the `v > eff_max_` test in relax_learned_bound() can never
+            // hold either, so nothing ever walked it back out. In the recorded
+            // run that closed +Y and +Z permanently: the taper weight was pinned
+            // at 0.10 in 300/1370 and 362/1370 of the taper frames, all of them
+            // with the arm parked at HOME.
+            //
+            // Writing the attempted target instead costs one step of headroom,
+            // so the arm can always creep up to the wall, the taper never sits on
+            // its floor at the current pose, and each further refusal just
+            // re-tightens by the step it was asked for.
+            const float bound = from_mm[a] + step_mm[a];
             if (bound < eff_max_[a]) eff_max_[a] = bound;
         } else if (step_mm[a] < -kBoundLearnMinStepMm) {
-            const float bound = std::max(from_mm[a] + step_mm[a], from_mm[a]);
+            const float bound = from_mm[a] + step_mm[a];
             if (bound > eff_min_[a]) eff_min_[a] = bound;
         }
     }
@@ -788,7 +835,27 @@ void RobotLink::learn_from_rejection(const float from_mm[3], const float step_mm
 }
 
 // An accepted step proves the point it reached is reachable, so the learned
-// bound can relax back toward where the arm actually got to.
+// bound can relax back out.
+//
+// Relaxation must be able to fire WITHOUT first reaching past the bound,
+// because a bound pulled in by a single refusal is a guess about a whole face of
+// the reachable set - and that guess can be wrong for reasons the refusal never
+// reveals. On this backend the server refuses the WHOLE command when ANY ONE axis
+// falls outside its workspace, so a +Z limit refusal also tightens Y, which was
+// never implicated. A guess like that has to expire.
+//
+// So every relax tick does two things:
+//   (a) snap outward to `v` if the arm was just PROVED to be beyond the bound
+//       (kRelaxFraction of the gap - keeps a freshly contradicted bound honest);
+//   (b) drift every bound kRelaxToPriorFraction of the way back toward its PRIOR
+//       band even if nothing was proved.
+//
+// (b) is what turns the learned bound from a permanent wall into evidence with a
+// half-life. It relaxes toward the measured band, never the caps box: the box
+// overstates the reachable set by up to 4x, so drifting toward it would just
+// re-open the refusal tail the learner exists to stop. Because the relaxation
+// only ticks on ACCEPTED commands, bounds re-open only while the arm is actually
+// being driven - a parked arm keeps whatever it learned.
 void RobotLink::relax_learned_bound(const float reached_mm[3]) {
     if (!eff_init_ || !caps_.valid) return;
     // Only relax every N acceptances: a single success at one (y,z) says little
@@ -797,14 +864,19 @@ void RobotLink::relax_learned_bound(const float reached_mm[3]) {
     if (++eff_relax_count_ < kRelaxEveryNAccepts) return;
     eff_relax_count_ = 0;
     for (int a = 0; a < 3; ++a) {
-        // Ease out toward the caps box by a fraction of the gap, never past it.
-        const float v = clampf(reached_mm[a], caps_.ws_min[a], caps_.ws_max[a]);
-        if (v > eff_max_[a]) {
-            eff_max_[a] += (v - eff_max_[a]) * kRelaxFraction;
-        }
-        if (v < eff_min_[a]) {
-            eff_min_[a] -= (eff_min_[a] - v) * kRelaxFraction;
-        }
+        float prior_lo = 0.0f, prior_hi = 0.0f;
+        prior_bounds(a, prior_lo, prior_hi);
+        const float v = clampf(reached_mm[a], prior_lo, prior_hi);
+
+        // (a) proved: ease out to the point the arm just reached, at the faster
+        //     rate, because this bound was directly contradicted.
+        // (b) unproved: drift out toward the prior band, at the gentler rate.
+        const bool proved_hi = v > eff_max_[a];
+        const bool proved_lo = v < eff_min_[a];
+        const float hi_target = proved_hi ? v : prior_hi;
+        const float lo_target = proved_lo ? v : prior_lo;
+        eff_max_[a] += (hi_target - eff_max_[a]) * (proved_hi ? kRelaxFraction : kRelaxToPriorFraction);
+        eff_min_[a] += (lo_target - eff_min_[a]) * (proved_lo ? kRelaxFraction : kRelaxToPriorFraction);
     }
 }
 
@@ -852,9 +924,11 @@ bool RobotLink::step(const HandState& hs, int64_t now_ms) {
         presence_established_ = true;
         hand_seen_ = detected;
         hand_present_.store(detected);
+        last_seen_ms_ = detected ? now_ms : 0;
         if (!detected) ++miss_streak_;
     } else if (detected) {
         miss_streak_ = 0;
+        last_seen_ms_ = now_ms;
         if (!hand_seen_) {
             just_returned = true;
             hand_seen_ = true;
@@ -863,10 +937,25 @@ bool RobotLink::step(const HandState& hs, int64_t now_ms) {
         }
     } else {
         ++miss_streak_;
-        if (hand_seen_ && miss_streak_ >= std::max(1, cfg_.lost_frames)) {
+        // Departure == a CONTINUOUS absence of `hand_lost_ms`, measured from the
+        // last DETECTION rather than by counting misses. That distinction is the
+        // whole point: the detector is bursty (clusters of 4-10 frames split by
+        // 0.9-19 s of nothing), so a frame count sits inside the natural gap
+        // between clusters and turns every cluster boundary into a false exit.
+        // See RobotConfig::hand_lost_ms for the measurement behind 2000 ms.
+        //
+        // `last_seen_ms_ > 0` guards a session that starts with no hand at all:
+        // nothing has ever been latched, so there is no clock to measure from.
+        const bool timed_out =
+            last_seen_ms_ > 0 && (now_ms - last_seen_ms_) >= cfg_.hand_lost_ms;
+        if (hand_seen_ && timed_out) {
             hand_seen_ = false;
             hand_present_.store(false);
             hand_left_seen_.store(true);
+            CA_LOG_DEBUG("[ROBOT] hand absent for {} ms (threshold {} ms) - "
+                         "treated as left the frame",
+                         static_cast<long long>(now_ms - last_seen_ms_),
+                         static_cast<long long>(cfg_.hand_lost_ms));
             // Drop the latches so the next entry starts clean.
             last_gesture_ = Gesture::Unknown;
             have_last_good_ = false;
@@ -1062,39 +1151,47 @@ bool RobotLink::step(const HandState& hs, int64_t now_ms) {
     const float w_y = have_pos ? boundary_weight(pos_mm, 1, raw_y) : 1.0f;
     const float w_z = have_pos ? boundary_weight(pos_mm, 2, raw_z) : 1.0f;
 
-    const float dx_mm = raw_x * w_x;
-    const float dy_mm = raw_y * w_y;
-    const float dz_mm = raw_z * w_z;
+    float dx_mm = raw_x * w_x;
+    float dy_mm = raw_y * w_y;
+    float dz_mm = raw_z * w_z;
 
-    // Fully suppress a step that is pressed against a learned bound and still
-    // pushing outward. This is the difference between "slow down at the wall"
-    // and "stop pushing at the wall": once the bound has been learned right down
-    // to where the arm is stuck, the floor gain still scales a normal step to
-    // ~1.3 mm - above the deadzone - so a taper alone keeps emitting steps that
-    // keep being refused (measured: 21 refusals over 25 pushed frames even with
-    // the taper fully engaged).
+    // Suppress, PER AXIS, a step that is pressed against a learned bound and
+    // still pushing outward. This is the difference between "slow down at the
+    // wall" and "stop pushing at the wall": once the bound has been learned
+    // right down to where the arm is stuck, the floor gain still scales a normal
+    // step to ~1.3 mm - above the deadzone - so a taper alone keeps emitting
+    // steps that keep being refused (measured: 21 refusals over 25 pushed frames
+    // even with the taper fully engaged).
     //
-    // Skipping is the physically right answer (the arm cannot go there) and it
-    // costs nothing, because the direction test above already guarantees the
-    // opposite direction is untampered - the arm can always come back out.
+    // The zeroing is confined to the axis that is actually pinned. This used to
+    // be an all-or-nothing early return: the first axis found pinned ended the
+    // WHOLE frame, so a hand that had stopped travelling along one direction
+    // froze the arm on all three. That is wrong twice over - a Cartesian
+    // movexyz is exactly what slide-along-a-wall means, and this arm parks near
+    // its edges at HOME (-X has 9 mm of travel left, +Z has 5 mm), so "my hand
+    // moved but the arm did not" appears the moment one axis bottoms out while
+    // the other two still have room. Suppressing only the pinned axis is the
+    // same physics with the dead axis removed instead of the whole frame.
+    //
+    // Skipping is still the right answer for the pinned axis itself (the arm
+    // cannot go there), and it costs nothing: the direction test in
+    // boundary_weight() already guarantees the opposite direction is untampered,
+    // so the arm can always come back out.
+    //
+    // When every axis ends up zeroed, do_movexyz() below sees a below-deadzone
+    // magnitude and counts it as a skip - the same bookkeeping the old early
+    // return did, minus the frame-wide blast radius.
     if (cfg_.soft_boundary && have_pos) {
-        if (w_x <= cfg_.soft_min_gain + 1e-4f && push_out_of_bound(pos_mm, 0, raw_x)) {
-            ++skipped_;
-            last_send_ms_ = now_ms;
-            CA_LOG_DEBUG("[ROBOT] soft boundary: x step suppressed at the bound");
-            return client_->connected();
-        }
-        if (w_y <= cfg_.soft_min_gain + 1e-4f && push_out_of_bound(pos_mm, 1, raw_y)) {
-            ++skipped_;
-            last_send_ms_ = now_ms;
-            CA_LOG_DEBUG("[ROBOT] soft boundary: y step suppressed at the bound");
-            return client_->connected();
-        }
-        if (w_z <= cfg_.soft_min_gain + 1e-4f && push_out_of_bound(pos_mm, 2, raw_z)) {
-            ++skipped_;
-            last_send_ms_ = now_ms;
-            CA_LOG_DEBUG("[ROBOT] soft boundary: z step suppressed at the bound");
-            return client_->connected();
+        const float raw[3] = {raw_x, raw_y, raw_z};
+        const float w[3] = {w_x, w_y, w_z};
+        float* const step[3] = {&dx_mm, &dy_mm, &dz_mm};
+        static const char* const kAxisName[3] = {"x", "y", "z"};
+        for (int a = 0; a < 3; ++a) {
+            if (w[a] <= cfg_.soft_min_gain + 1e-4f && push_out_of_bound(pos_mm, a, raw[a])) {
+                *step[a] = 0.0f;
+                CA_LOG_DEBUG("[ROBOT] soft boundary: {} step suppressed at the bound",
+                             kAxisName[a]);
+            }
         }
     }
 
