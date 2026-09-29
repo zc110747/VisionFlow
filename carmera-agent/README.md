@@ -71,7 +71,7 @@ camera-agent/
 │   └── common/stream_controller.cpp  # 编排 + 自动重连
 ├── third_party/
 │   └── stb_image.h           # 单元测试用的单头 JPEG/PNG 解码（仅 tests 链接）
-├── tests/                    # 轻量测试框架 + 56 个用例（强制 SIM 后端，可无头运行）
+├── tests/                    # 轻量测试框架 + 88 个用例（可无头运行；需 PATH 含 GStreamer / ORT）
 │   ├── golden/               # 手部黄金夹具 + 全量 anchor 参考表 + 生成脚本（见 golden/README.md）
 │   └── finished/             # 运行/验证产物（日志、抓帧）落此处，已 gitignore
 └── scripts/
@@ -117,10 +117,12 @@ camera-agent/
 # 必须用原生 PowerShell 运行（非 MSYS2 bash），且以非沙箱方式跑（需写注册表/调 cl.exe）
 .\scripts\build-msvc.ps1                  # gstreamer 后端（默认）
 .\scripts\build-msvc.ps1 -Backend sim     # SIM 后端
-.\scripts\build-msvc.ps1 -Clean           # 先清空 build-msvc 再构建
+.\scripts\build-msvc.ps1 -Clean           # 先清空对应构建目录再构建
 ```
 
-产物：`build-msvc\src\camera-agent.exe`（约 311 KB，目标 0 warning / 0 error）。
+**产物目录按后端分流，别搞混**：`-Backend gstreamer` 输出到 **`build-msvc-gst\src\camera-agent.exe`**
+（约 628 KB），`-Backend sim` 才用 `build-msvc\`。分流是为了让 SIM 构建不覆盖 GStreamer 构建，
+根目录 `start.bat` 两个都找、优先 `build-msvc-gst`。目标 0 warning / 0 error。
 
 ### 备选：一键构建 bat
 
@@ -869,13 +871,17 @@ build-msvc-gst\src\camera-agent.exe --ai --ai-mode hand --robot ^
 
 ## 验证流程
 
-### 1. 单元测试（SIM 后端，无头）
+### 1. 单元测试（无头）
 
 ```bash
-ctest --test-dir build-msvc --output-on-failure
-# 或 build 目录（sim 后端）
+ctest --test-dir build-msvc-gst --output-on-failure   # gstreamer 后端构建（默认）
+ctest --test-dir build-msvc --output-on-failure       # SIM 后端构建（build_oneclick.bat 产物）
+# 或 build 目录（cmake -B build -DCAMERA_AGENT_BACKEND=sim）
 ctest --test-dir build --output-on-failure
 ```
+
+> 需要 `PATH` 里有 GStreamer 的 `bin`（DLL）与 ONNX Runtime 的 `lib`；缺 ORT / 真帧夹具时
+> 对应 AI 用例会打印 `[skip]` 并按通过计。
 
 覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、**运行时 AI 模式切换（Detect↔Pose、Detect↔Hand 不重启）**、手部（anchor 全 2016 值核对、黄金图 21 点亚毫像素比对、坐标映射/EMA/reference/deadzone/手势去抖、hand 报文逐字节固定）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）、**手势真机数据回归（实测开掌/握拳 landmark 逐位冻结，钉住 `kCurledRatio`）**、**机器人控制（`RobotLink` 状态机 + 七条协议坑、合成序列对已知几何真值、真实帧鲁棒性、真 socket 直驱 sim 臂并断言**臂真的位移**、软边界（曲线/贴边减速/关闭即旧行为/**实测 span 基准**/**拒绝后细探**/**细探开关**）、后端不可达重试与自愈、**交付手感（`gain` 默认值 + 降幅步长表被算术钉住、yaml 与内置默认一致）**、**`delta` 帧间差分（累积量不可逐帧重发、限流帧仍推进基准、未锁参考点不推进基准）**、**手势静默窗口（握拳/张开只开关不平动、窗口内丢弃位移、关闭即旧行为）**）**。**88/88 通过**（sim / gstreamer / LIVE 三模式各跑一遍）。
 

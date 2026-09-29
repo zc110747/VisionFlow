@@ -23,10 +23,13 @@
 *.dll
 *.so.*
 
-
-# Fortran module files
-*.mod
+# Fortran module files.
+# NOTE: do NOT re-add a bare '*.mod' pattern here. It also matches Go's
+# go.mod, and git then skips it silently on 'git add' - which is exactly how
+# video-server/go.mod went missing and broke 'go build' with
+# "directory prefix . does not contain main module".
 *.smod
+!go.mod
 
 # Compiled Static libraries
 *.lai

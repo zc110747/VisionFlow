@@ -198,13 +198,18 @@ foreach ($e in @('dshowvideosrc','ksvideosrc','videoconvert','x264enc',
 
 ## 5. 你装完后我会执行的下一步
 
-1. 删除失效的 `build/`，重建 MSVC 构建目录
+1. 重建 MSVC 构建目录 —— **用 Ninja 生成器，不要用 VS 生成器**
+   （本机 `MSBuild.exe` 一编译真实工程就 access violation 崩溃，见 README「构建约定」）
    ```powershell
-   cmake -S . -B build-msvc -G "Visual Studio 17 2022" -A x64
-   cmake --build build-msvc --config Release
+   .\scripts\build-msvc.ps1 -Backend gstreamer     # -> build-msvc-gst\
+   ```
+   等价的手工命令（需先有 MSVC x64 环境与 VS 自带 CMake/Ninja 在 PATH）：
+   ```powershell
+   cmake -S . -B build-msvc-gst -G Ninja -DCMAKE_BUILD_TYPE=Release -DCAMERA_AGENT_BACKEND=gstreamer
+   cmake --build build-msvc-gst
    ```
 2. 确认 `-- Camera-Agent backend selected: gstreamer`
-3. 跑单元测试：`ctest --test-dir build-msvc -C Release --output-on-failure`
+3. 跑单元测试：`ctest --test-dir build-msvc-gst --output-on-failure`
 4. 处理第 4 节的问题 1（`rtsp_publisher_gst.cpp`），打通 gstreamer 后端编译
 5. 跑 `camera-agent --list` 验证摄像头枚举
 6. 启动 MediaMTX → 推流 → `ffplay` 拉流 → 断服重连验收

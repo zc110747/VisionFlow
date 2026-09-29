@@ -104,7 +104,7 @@ VisionFlow/
 │   │   ├── metadata/             # encoder / manager / http_transport_winhttp.cpp
 │   │   └── config/ common/       # 极简 YAML 解析 / StreamController 编排与自动重连
 │   ├── models/                   # yolo11n.onnx（检测）、yolo11n-pose.onnx（17 关键点）
-│   ├── tests/                    # 轻量测试框架，29 个用例（SIM 后端，可无头运行）
+│   ├── tests/                    # 轻量测试框架，88 个用例（可无头运行）
 │   ├── scripts/                  # build-msvc.ps1 / e2e-test.ps1 / probe-*.ps1 / mock server
 │   └── build_oneclick.bat        # 一键构建（vcvarsall + VS 自带 CMake/Ninja）
 │
@@ -213,6 +213,18 @@ build_onelick.bat --no-pause            :: 无人值守（CI）
 > 只想构建单个子项目：
 > `cd video-server\web && npm install && npm run build` → `cd .. && go build -trimpath -o video-server.exe ./cmd/video-server`；
 > `cd carmera-agent && build_oneclick.bat`（或 `.\scripts\build-msvc.ps1 [-Backend sim] [-Clean]`）。
+
+> ⚠️ **`video-server/go.mod` 必须存在于工作区。** 它一度缺失，`go build` 会报
+> `pattern ./...: directory prefix . does not contain main module`（或 `go.mod file not found`），
+> 看起来像 Go 环境坏了，其实是仓库根本没有这个文件。根因是仓库根 `.gitignore` 里曾有一行
+> `*.mod`（本意是 Fortran 模块文件），它同时匹配 Go 的 `go.mod`，于是 `git add` **静默跳过**、
+> 文件从未被提交——`go.sum` 却提交了。现已在 `.gitignore` 中改为显式 `!go.mod` 例外并加注释。
+> 判断某文件是否被忽略：`git check-ignore -v video-server/go.mod`（**有输出=被忽略**）。
+> 若在旧分支上遇到该问题：`cd video-server && go mod tidy` 可依据 `go.sum` 重建 `go.mod`。
+
+> ℹ️ **agent 的构建目录有两个名字，别搞混**：`scripts\build-msvc.ps1 -Backend gstreamer`
+> 输出到 **`build-msvc-gst`**（`-Backend sim` 才用 `build-msvc`），而 `build_oneclick.bat`
+> 输出到 `build-msvc`。根目录 `start.bat` 两个都会找，优先 `build-msvc-gst`。
 
 ### 3. 一键运行（推荐：联合运行）
 
@@ -437,10 +449,10 @@ agent → server 的**单向异步**通道，与视频流互不阻塞。一个�
 ### 单元测试
 
 ```bash
-# carmera-agent：29 个用例（强制 SIM 后端，可无头运行；ORT 缺失时 AI 用例自动 skip）
-cd carmera-agent && ctest --test-dir build-msvc --output-on-failure
+# carmera-agent：88 个用例（GStreamer 构建在 build-msvc-gst；ORT / 真帧集缺失时 AI 用例自动 skip）
+cd carmera-agent && ctest --test-dir build-msvc-gst --output-on-failure
 
-# video-server：40 个用例
+# video-server：91 个断言（62 个顶层用例 + 29 个子测试）
 cd video-server && go test ./...
 ```
 
@@ -453,7 +465,7 @@ AI 端到端（真图检出 + ByteTrack 稳定 ID + 生命周期）/ YOLO11 双�
 
 ```bash
 cd video-server
-python scripts/verify_joint.py          # 真实推流端（C++ agent + GStreamer）整条链路，PASS=11 FAIL=0
+python scripts/verify_joint.py          # 真实推流端（C++ agent + GStreamer）整条链路，PASS=19 FAIL=0
 python scripts/verify_joint.py --keep   # 结束时不杀进程，便于人工查看
 python scripts/verify_e2e.py            # ffmpeg 合成流，多路并发
 python scripts/verify_metadata.py       # AI metadata 接收（含旧版无 type 兼容）
@@ -465,9 +477,15 @@ python scripts/verify_keypoints_aimode.py # keypoints 透传 + AI 模式联动
 cd carmera-agent && .\scripts\e2e-test.ps1
 ```
 
-`verify_joint.py` 断言的检查项：agent 枚举到摄像头 → 服务三态健康 → agent 进入 `STREAMING`
-→ 流被 monitor 自动注册并置 `online` → `ffprobe` 在 RTSP 上解出 h264 → 协商分辨率经
-MediaMTX 传到 API 且与实测一致 → WHEP 信令端点可达。
+`verify_joint.py` 断言的检查项（stage 1→6b）：agent 枚举到摄像头 → 服务三态健康
+（`database` / `media_server` / `status` 全 `ok`）→ agent 进入 `STREAMING` → 流被 monitor
+自动注册并置 `online` → `ffprobe` 在 RTSP 上真解出 `h264` → 协商分辨率 / fps / bitrate
+经 MediaMTX 传到 API 且与实测一致 → AI metadata 心跳与 frame 到达服务端、`object_count`
+与 payload 一致、bbox 落在画面内。
+
+> stage 7（WHEP 信令）是**信息项，不计入 PASS/FAIL**：脚本发的是手工拼的 SDP，缺少
+> `ice-ufrag` / `fingerprint`，无法完成 ICE/DTLS 协商；服务端对任何 WHEP 信令失败统一返回
+> `502 Bad Gateway`（`internal/api/handlers.go`）。要验证完整播放路径请用真实浏览器打开 Web UI。
 
 ---
 

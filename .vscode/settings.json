@@ -1,3 +1,3 @@
 {
-    "cmake.sourceDirectory": "D:/user_project/git/VisionFlow/carmera-agent"
+    "cmake.sourceDirectory": "${workspaceFolder}/carmera-agent"
 }
