@@ -362,6 +362,11 @@ bool RobotLink::open() {
     // again and let the refusals teach it afresh.
     eff_init_ = false;
     eff_relax_count_ = 0;
+    // The differencing basis belongs to the OLD session: after a reconnect the
+    // hand may be somewhere else entirely, and keeping prev_delta_ would make
+    // the first frame after reconnect emit that whole change as one step.
+    have_prev_delta_ = false;
+    muted_until_ms_ = 0;
     return true;
 }
 
@@ -865,6 +870,11 @@ bool RobotLink::step(const HandState& hs, int64_t now_ms) {
             // Drop the latches so the next entry starts clean.
             last_gesture_ = Gesture::Unknown;
             have_last_good_ = false;
+            // ...including the differencing basis. A hand that comes back is a
+            // NEW origin (its reference is re-latched too), so holding an old
+            // prev_delta_ would emit the difference between two unrelated
+            // positions as one step.
+            have_prev_delta_ = false;
         }
     }
 
@@ -889,31 +899,55 @@ bool RobotLink::step(const HandState& hs, int64_t now_ms) {
         (cfg_.gesture_home == "open_palm" && g == Gesture::OpenPalm) ||
         (cfg_.gesture_home == "fist"      && g == Gesture::Fist);
 
+    // A discrete gesture means "switch, do not steer". Mute continuous motion
+    // for `gesture_mute_ms` afterwards - see the field comment for why forming
+    // a fist produces real, followable hand motion for several frames before the
+    // classifier even confirms it.
+    const int64_t mute_ms = std::max(0, cfg_.gesture_mute_ms);
+    auto start_mute = [&]() { muted_until_ms_ = now_ms + mute_ms; };
+
     if (rising && home_gesture) {
         last_gesture_ = g;
         last_send_ms_ = now_ms;
+        start_mute();
         return step_exchange(do_home());
     }
 
     if (rising && cfg_.gesture_gripper && g == Gesture::Fist) {
         last_gesture_ = g;
         last_send_ms_ = now_ms;
+        start_mute();
         return step_exchange(do_gripper(true));
     }
     if (rising && cfg_.gesture_gripper && g == Gesture::OpenPalm &&
         !home_gesture && gripper_closed_) {
         last_gesture_ = g;
         last_send_ms_ = now_ms;
+        start_mute();
         return step_exchange(do_gripper(false));
     }
     last_gesture_ = g;
     // ---- continuous motion -------------------------------------------------
-    if (now_ms - last_send_ms_ < period_ms) return true;
+
+    // Muted: a gesture just fired. Re-latch the differencing basis every frame
+    // so the motion that happened while the hand was forming (or holding) the
+    // gesture is DROPPED, not accumulated and then replayed as one big step when
+    // the window ends.
+    if (now_ms < muted_until_ms_) {
+        prev_delta_[0] = hs.delta.x;
+        prev_delta_[1] = hs.delta.y;
+        prev_delta_[2] = hs.delta.z;
+        have_prev_delta_ = true;
+        last_send_ms_ = now_ms;
+        return client_->connected();
+    }
 
     // hand_types.h is explicit: while the reference is not latched, `delta` is
     // meaningless and MUST NOT be consumed - that is what prevents the large
     // jump when a hand first enters the frame. Sending nothing here is the
-    // correct behaviour, not a dropped frame.
+    // correct behaviour, not a dropped frame. The differencing basis is left
+    // alone as well: the deltas from before the latch belong to the discarded
+    // pre-latch window and must not become the origin of the first real step.
     if (!hs.reference_initialized) return true;
 
     if (cfg_.map_mode == "absolute") {
@@ -982,9 +1016,47 @@ bool RobotLink::step(const HandState& hs, int64_t now_ms) {
 
     // The raw (pre-taper) steps, so the weight can tell "heading into the wall"
     // from "coming back out". Order matches the axis mapping below.
-    const float raw_x = hs.delta.y * gain_x;
-    const float raw_y = -hs.delta.x * gain_y;
-    const float raw_z = hs.delta.z * gain_z;
+    //
+    // ---- frame-to-frame differencing -------------------------------------
+    // `hs.delta` is the hand's CUMULATIVE offset from its latched reference
+    // (position - reference), NOT this frame's motion - see have_prev_delta_ in
+    // the header. The arm wants the increment, so take the difference against
+    // the previous frame's delta, which collapses to (pos_now - pos_prev).
+    //
+    // The basis advances on EVERY frame, including frames the rate limiter is
+    // about to drop (that is why the limiter is checked below, not above). If a
+    // throttled frame left the basis behind, its motion would be banked and then
+    // replayed as one bigger step on the next allowed frame - which is exactly
+    // the "stutters, then jerks" feel this is fixing. A dropped frame drops its
+    // motion; nothing accumulates.
+    //
+    // The FIRST frame has no predecessor: starting from zero would send the
+    // whole accumulated offset as one step (the exact jump this fixes), so the
+    // first frame only latches the basis and sends nothing.
+    float inc_x = 0.0f, inc_y = 0.0f, inc_z = 0.0f;
+    if (have_prev_delta_) {
+        inc_x = hs.delta.x - prev_delta_[0];
+        inc_y = hs.delta.y - prev_delta_[1];
+        inc_z = hs.delta.z - prev_delta_[2];
+    }
+    prev_delta_[0] = hs.delta.x;
+    prev_delta_[1] = hs.delta.y;
+    prev_delta_[2] = hs.delta.z;
+    const bool first_frame = !have_prev_delta_;
+    have_prev_delta_ = true;
+    if (first_frame) {
+        last_send_ms_ = now_ms;
+        return client_->connected();
+    }
+
+    // ---- rate limit --------------------------------------------------------
+    // Checked after the basis has advanced: the limiter decides whether this
+    // frame is SENT, never whether the hand actually moved.
+    if (now_ms - last_send_ms_ < period_ms) return true;
+
+    const float raw_x = inc_y * gain_x;
+    const float raw_y = -inc_x * gain_y;
+    const float raw_z = inc_z * gain_z;
 
     const float w_x = have_pos ? boundary_weight(pos_mm, 0, raw_x) : 1.0f;
     const float w_y = have_pos ? boundary_weight(pos_mm, 1, raw_y) : 1.0f;

@@ -169,6 +169,27 @@ struct RobotConfig {
     // returned the arm HOME and broke the follow. 6 rides out the burst.
     int lost_frames = 6;
 
+    // --- gesture mute window -------------------------------------------------
+    // After a discrete gesture fires (gripper open/close, or home), continuous
+    // motion is MUTED for this long. Why it is needed at all:
+    //
+    // Making a fist is not a still pose. The fingers curl, the landmark bbox
+    // shrinks and its centre drifts, so the HandState's position genuinely moves
+    // while the operator is forming the gesture - and the classifier only
+    // confirms after `gesture_confirm_frames` (5) frames. So a fist produces
+    // half a second of honest-looking hand motion BEFORE it is recognised as a
+    // gesture at all, and that motion was being followed by the arm.
+    //
+    // The operator's intent is "make a switch, do not move" (measured: the arm
+    // visibly walked away while the fist formed). Mutting is the only way to say
+    // "this stretch of hand motion was gesture-forming, not steering".
+    //
+    // 500 ms covers the 5-frame confirm window (~625 ms at the hand branch's
+    // ~8 Hz) plus the curl itself. The basis is re-latched when the window
+    // ends, so motion during the window is DISCARDED rather than replayed -
+    // replaying it would turn a held fist back into a jump.
+    int gesture_mute_ms = 500;
+
     bool log_commands = true;   // log every command with the raw reply
 };
 

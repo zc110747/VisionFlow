@@ -228,6 +228,37 @@ private:
     bool  have_last_good_ = false;
     float last_good_mm_[3] = {0, 0, 0};
 
+    // --- frame-to-frame differencing (delta route) -------------------------
+    // THE BUG THIS FIXES. HandState::delta is `position - reference`, and the
+    // reference is latched ONCE and never moves (hand_analyzer.cpp step 3). So
+    // the field is a CUMULATIVE offset from wherever the hand first settled -
+    // it does not fall back to zero when the hand stops.
+    //
+    // Treating it as "how far to move this frame" therefore re-sends the same
+    // displacement every frame: hand moves 0.10 and holds, and the arm is
+    // commanded 0.10 worth of millimetres 8 times a second. Measured symptom:
+    // the arm crept, stalled at the deadzone, then jumped. The reference client
+    // (gesture_bridge.py::nudge) takes a per-call increment, so nothing there
+    // contradicted the wrong reading.
+    //
+    // The arm wants the INCREMENT, so this link does the differencing itself:
+    //   increment = delta_now - delta_prev
+    // which is exactly (position_now - position_prev) and is zero when the hand
+    // holds still. Keeping it here - rather than changing the analyzer's
+    // reference policy - leaves HandState a pure per-frame report and keeps the
+    // metadata/UI consumers of `delta` (which really do want the cumulative
+    // value) untouched.
+    bool  have_prev_delta_ = false;
+    float prev_delta_[3] = {0, 0, 0};
+
+    // --- gesture mute window -----------------------------------------------
+    // Until this timestamp, continuous motion is suppressed: a discrete gesture
+    // has just fired, and the hand motion that accompanied forming it must not
+    // steer the arm. On expiry the differencing basis is re-latched to the
+    // current delta, so everything that happened during the window is dropped
+    // instead of being replayed as one large step.
+    int64_t muted_until_ms_ = 0;
+
     // --- learned effective reachable bounds (soft boundary) ----------------
     // caps.ws_min/ws_max is a BOUNDING BOX, and a loose one. Measured against
     // the real sim backend at the home height: x stops being solvable at ~150 mm

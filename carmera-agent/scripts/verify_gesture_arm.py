@@ -54,7 +54,14 @@ SOFT_BOUNDARY = ["robot_soft_boundary_tapers_gain_monotonically",
                  # Feel: a pin on the shipped gain/span values, so retuning the
                  # arm's responsiveness (hand big -> arm small) cannot happen
                  # silently. See robot_link_tests.cpp ㉑.
-                 "robot_shipped_gains_are_the_documented_feel"]
+                 "robot_shipped_gains_are_the_documented_feel",
+                 # A gesture is a SWITCH, not a move: the motion the hand makes
+                 # while forming a fist must not steer the arm. ㉓.
+                 "robot_gesture_mutes_continuous_motion",
+                 "robot_gesture_mute_off_is_the_old_behaviour"]
+# The cumulative-delta bug: `delta` is an offset from a once-latched reference,
+# so it must be differenced per frame or it is replayed on every frame. ㉒.
+DELTA_SEMANTICS = ["robot_cumulative_delta_is_not_replayed_every_frame"]
 BACKEND_RETRY = ["robot_unreachable_backend_retries_and_recovers"]
 
 results: list[tuple[str, bool, str]] = []
@@ -177,6 +184,13 @@ def main() -> int:
     print("\n[Level 2c] soft boundary + backend self-healing (no hardware)")
     for name in SOFT_BOUNDARY + BACKEND_RETRY:
         record(name, st.get(name, False))
+
+    print("\n[Level 2d] delta semantics + gesture switching (no hardware)")
+    for name in DELTA_SEMANTICS:
+        record(name, st.get(name, False))
+    for line in out.splitlines():
+        if "cumulative" in line or "increment" in line:
+            print(f"        {line.strip()}")
 
     # ---- Level 3: manual ----------------------------------------------
     print("\n[Level 3] live camera - MANUAL")

@@ -256,6 +256,39 @@ int count_cmds(const std::vector<std::string>& reqs, const std::string& needle) 
     return n;
 }
 
+// The `k`-th component of the delta array of a movexyz request; 0 on a parse
+// miss. Free function (rather than reusing FakeClient's private helper) so the
+// assertions on emitted step SIZE read the same way as the ones on counts.
+// Hand-rolled for the same C4996 reason as the FakeClient copy.
+float delta_component(const std::string& req, int k) {
+    const size_t lb = req.find('[');
+    if (lb == std::string::npos) return 0.0f;
+    size_t i = lb + 1;
+    for (int c = 0; c <= k; ++c) {
+        const size_t comma = req.find_first_of(",]", i);
+        if (comma == std::string::npos) return 0.0f;
+        if (c == k) {
+            try {
+                return std::stof(req.substr(i, comma - i));
+            } catch (...) {
+                return 0.0f;
+            }
+        }
+        i = comma + 1;
+    }
+    return 0.0f;
+}
+
+// The delta of the LAST movexyz request in `reqs`.
+float last_movexyz_delta(const std::vector<std::string>& reqs, int k) {
+    for (auto it = reqs.rbegin(); it != reqs.rend(); ++it) {
+        if (it->find("\"movexyz\"") != std::string::npos) {
+            return delta_component(*it, k);
+        }
+    }
+    return 0.0f;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -346,21 +379,24 @@ TEST(robot_zero_delta_is_skipped_not_failed) {
     ASSERT(f.link.connect_if_needed());
     const int64_t t = 1000;
 
-    // Establish presence first: the first frame of a session is consumed by the
-    // presence rule and never reaches the delta logic.
+    // The first continuous frame only LATCHES the differencing basis (it has no
+    // predecessor to subtract), so it sends nothing - that is the fix for the
+    // "cumulative delta replayed every frame" bug, not a swallowed frame.
     HandState warm = make_hand();
     warm.delta = Vec3{0.0f, 0.0f, 0.0f};
     f.link.update(warm, t - 100);
     ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), 0);
 
+    // Now a real frame with a held (still) hand: delta unchanged, so the
+    // increment is zero.
     HandState hs = make_hand();
     hs.delta = Vec3{0.0f, 0.0f, 0.0f};
     const bool alive = f.link.update(hs, t);
     ASSERT(alive);         // the link is fine - "nothing to do" is not an error
     ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), 0);   // nothing was written
-    // Two sub-deadzone frames => two skips, and crucially no rejection: an
+    // One sub-deadzone frame => one skip, and crucially no rejection: an
     // all-zero vector must never reach the server as a parameter error.
-    ASSERT_EQ(f.link.commands_skipped(), static_cast<int64_t>(2));
+    ASSERT_EQ(f.link.commands_skipped(), static_cast<int64_t>(1));
     ASSERT_EQ(f.link.commands_rejected(), static_cast<int64_t>(0));
     return true;
 }
@@ -429,20 +465,30 @@ TEST(robot_rate_limit_throttles_move_commands) {
     ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), 0);
 
     HandState hs = make_hand();
-    hs.delta = Vec3{0.10f, 0.0f, 0.0f};   // well above the deadzone
+    // The hand keeps travelling: delta is CUMULATIVE (relative to the latched
+    // reference), so every frame below advances it by another 0.10. A constant
+    // delta would now mean "the hand is holding still" and, correctly, produce
+    // no further commands.
+    float d = 0.10f;
 
     // Five frames 10 ms apart inside one 66 ms period: exactly one may go out.
     for (int i = 0; i < 5; ++i) {
+        hs.delta = Vec3{d, 0.0f, 0.0f};
+        d += 0.10f;
         f.link.update(hs, 1000 + i * 10);
     }
     ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), 1);
 
     // Once the period has elapsed, the next one is allowed through.
+    hs.delta = Vec3{d, 0.0f, 0.0f};
+    d += 0.10f;
     f.link.update(hs, 1000 + 100);
     ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), 2);
 
     // And a burst right after is throttled again.
     for (int i = 1; i < 5; ++i) {
+        hs.delta = Vec3{d, 0.0f, 0.0f};
+        d += 0.10f;
         f.link.update(hs, 1000 + 100 + i * 5);
     }
     ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), 2);
@@ -518,14 +564,29 @@ TEST(robot_no_move_before_reference_latched) {
     Fixture f(test_cfg());
     ASSERT(f.link.connect_if_needed());
 
+    // Two unlatched frames with a deliberately huge delta. Nothing may go out:
+    // while the reference is unlatched the delta is meaningless, and the
+    // differencing basis is not advanced either (the pre-latch window is
+    // discarded wholesale).
     HandState hs = make_hand_unlatched();
-    hs.delta = Vec3{0.5f, 0.5f, 0.5f};    // deliberately huge
+    hs.delta = Vec3{0.5f, 0.5f, 0.5f};
     f.link.update(hs, 1000);
+    hs.delta = Vec3{0.6f, 0.5f, 0.5f};
+    f.link.update(hs, 1100);
     ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), 0);
 
-    // Once latched, the same delta does go out.
+    // The first LATCHED frame now latches the differencing basis (there is no
+    // predecessor to subtract), so it must not carry a step yet.
     hs.reference_initialized = true;
-    f.link.update(hs, 1100);
+    hs.delta = Vec3{0.7f, 0.5f, 0.5f};
+    f.link.update(hs, 1200);
+    ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), 0);
+
+    // The next latched frame carries the real increment (0.8 - 0.7). Timestamps
+    // are spaced past the 15 Hz rate period (66 ms) so the limiter cannot swallow
+    // the frame instead of the reference gate being tested.
+    hs.delta = Vec3{0.8f, 0.5f, 0.5f};
+    f.link.update(hs, 1300);
     ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), 1);
     return true;
 }
@@ -736,6 +797,8 @@ TEST(robot_recovers_after_transport_drop) {
     ASSERT(f.link.connect_if_needed());
 
     HandState hs = make_hand();
+    // Cumulative delta, advanced per frame: a held delta means "the hand is
+    // still" and correctly produces no command to drop.
     hs.delta = Vec3{0.10f, 0.0f, 0.0f};       // above the deadzone
 
     // Establish presence first: that first frame issues no command, so arming
@@ -746,6 +809,7 @@ TEST(robot_recovers_after_transport_drop) {
     // The next exchange dies at the transport level. This is the ONE case where
     // update() reports false: the socket is gone, so the caller may reconnect.
     // The frame is recorded as an attempt first, then the socket drops.
+    hs.delta = Vec3{0.20f, 0.0f, 0.0f};       // the hand keeps moving
     f.fp->drop_next_ = true;
     ASSERT(!f.link.update(hs, 1000));
     ASSERT(!f.link.connected());
@@ -761,7 +825,11 @@ TEST(robot_recovers_after_transport_drop) {
     ASSERT(f.link.caps().valid);
 
     // ...and the rate limiter must not have been poisoned by the failure.
+    // NOTE this frame re-latches the differencing basis (open() cleared it on
+    // reconnect, so a stale prev_delta_ cannot emit the whole session's motion
+    // as one step). It therefore reports "alive" without sending.
     ASSERT(f.link.update(hs, 5000));
+    ASSERT(f.link.connected());
     return true;
 }
 
@@ -938,7 +1006,7 @@ TEST(robot_soft_boundary_off_is_the_old_behaviour) {
 
     HandState push = make_hand();
     push.delta = Vec3{0.0f, 0.10f, 0.0f};
-    f.link.update(push, 1000);      // latches the reported position
+    f.link.update(push, 1000);      // first increment; latches the reported position
 
     // The taper must be a no-op: the weight is exactly 1 on every axis, so the
     // emitted step is the full un-tapered one and the fake accepts it.
@@ -949,7 +1017,12 @@ TEST(robot_soft_boundary_off_is_the_old_behaviour) {
     const int64_t skipped_before = f.link.commands_skipped();
     const size_t  reqs_before    = f.fp->requests.size();
 
+    // Keep the hand travelling one 0.10 increment per period, so each frame has
+    // a real step to emit (a held delta is now correctly "no motion").
+    float dy = 0.10f;
     for (int i = 1; i <= 5; ++i) {
+        dy += 0.10f;
+        push.delta = Vec3{0.0f, dy, 0.0f};
         f.link.update(push, 1000 + i * 100);
     }
 
@@ -1203,5 +1276,138 @@ TEST(robot_shipped_gains_are_the_documented_feel) {
     ASSERT(span_over_active * def.reach_span_x * def.gain_x * move > 1.0f);
     ASSERT(span_over_active * def.reach_span_y * def.gain_y * move > 1.0f);
     ASSERT(span_over_active * def.reach_span_z * def.gain_z * move > 1.0f);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ㉒ THE CUMULATIVE-DELTA BUG.
+//
+// HandState::delta is `position - reference` against a reference that is latched
+// once and never moves (hand_analyzer.cpp step 3), so it is a CUMULATIVE offset:
+// it does NOT return to zero when the hand stops. The link used to feed it
+// straight into the gain, which meant "hand moved 0.10 and is now holding still"
+// was commanded as 0.10-worth of millimetres on EVERY frame - the arm crept,
+// stalled at the deadzone and then jumped. Measured on hardware as "the motion
+// is not continuous, it feels like stutter then a sudden move".
+//
+// The link must therefore take the per-frame DIFFERENCE, which is what this
+// test pins. The failure mode it guards against is invisible to every other
+// test in this file, because they all feed a delta that happens to change.
+// ---------------------------------------------------------------------------
+TEST(robot_cumulative_delta_is_not_replayed_every_frame) {
+    Fixture f(test_cfg());
+    ASSERT(f.link.connect_if_needed());
+
+    // Frame 0: the hand is at the reference (delta 0). This frame only LATCHES
+    // the differencing basis - it has no predecessor to subtract - so it sends
+    // nothing. That is deliberate: starting from an implicit zero would emit the
+    // whole accumulated offset as one step, which is the very jump being fixed.
+    HandState hs = make_hand();
+    hs.delta = Vec3{0.0f, 0.0f, 0.0f};
+    f.link.update(hs, 900);
+    ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), 0);
+
+    // Frame 1: the hand has now moved to +0.10, so delta reports 0.10. ONE
+    // command goes out, worth 0.10 (not 0.10 plus the locked-in basis).
+    hs.delta = Vec3{0.10f, 0.0f, 0.0f};
+    f.link.update(hs, 1000);
+    const int64_t after_first = count_cmds(f.fp->requests, "movexyz");
+    ASSERT_EQ(after_first, static_cast<int64_t>(1));
+
+    // Frames 2..6: THE HAND IS NOW HOLDING STILL, so delta stays at 0.10 (it is
+    // the same cumulative offset). Nothing more may be sent.
+    for (int i = 2; i <= 6; ++i) {
+        f.link.update(hs, 1000 + (i - 1) * 100);
+    }
+    ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), after_first);
+
+    // The step that DID go out must be one 0.10 increment, not a multiple of it.
+    // Axis mapping (see step()): hand X -> arm -Y. So a hand X increment of 0.10
+    // appears as the SECOND component of the arm's delta, scaled by the arm's Y
+    // span (gain pinned to 1.0 in test_cfg).
+    const float box_y = f.link.caps().ws_max[1] - f.link.caps().ws_min[1];
+    const float expect = -0.10f * (box_y / 0.5f);
+    const float seen = last_movexyz_delta(f.fp->requests, 1);
+    ASSERT(std::fabs(seen - expect) < 0.05f);
+
+    // And a further real move emits exactly the INCREMENT, not the new total.
+    hs.delta = Vec3{0.15f, 0.0f, 0.0f};        // +0.05 more
+    f.link.update(hs, 2000);
+    ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), after_first + 1);
+    const float expect_inc = -0.05f * (box_y / 0.5f);
+    const float last = last_movexyz_delta(f.fp->requests, 1);
+    ASSERT(std::fabs(last - expect_inc) < 0.05f);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ㉓ Gesture mute window: a discrete gesture must be a SWITCH, not a move.
+//
+// Forming a fist is not a still pose - the fingers curl, the landmark box
+// shrinks and its centre drifts - so the hand's reported position genuinely
+// moves for the several frames it takes the classifier to confirm (5 frames,
+// ~625 ms at the hand branch's ~8 Hz). The operator's intent is "close the
+// gripper", and the arm used to follow all of that motion instead.
+// ---------------------------------------------------------------------------
+TEST(robot_gesture_mutes_continuous_motion) {
+    RobotConfig cfg = test_cfg();
+    cfg.gesture_mute_ms = 500;
+    Fixture f(cfg);
+    ASSERT(f.link.connect_if_needed());
+
+    // A moving hand establishes the basis first.
+    HandState hs = make_hand();
+    hs.delta = Vec3{0.0f, 0.0f, 0.0f};
+    f.link.update(hs, 1000);
+
+    // The fist confirms: one gripper command, and NO move.
+    hs.gesture = Gesture::Fist;
+    const int64_t moves_before = count_cmds(f.fp->requests, "movexyz");
+    f.link.update(hs, 1100);
+    ASSERT_EQ(count_cmds(f.fp->requests, "gripper"), static_cast<int64_t>(1));
+    ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), moves_before);
+
+    // Now the operator's hand travels WHILE the fist is being held. Every one of
+    // these frames must be muted: the motion is gesture-forming (or post-gesture
+    // drift), not steering.
+    float d = 0.10f;
+    for (int i = 1; i <= 4; ++i) {
+        d += 0.10f;
+        hs.delta = Vec3{d, 0.0f, 0.0f};
+        f.link.update(hs, 1100 + i * 100);     // all inside the 500 ms window
+    }
+    ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), moves_before);
+
+    // Once the window expires the arm follows again - and, crucially, it does so
+    // from the CURRENT hand position: the motion during the window is DISCARDED,
+    // not replayed as one accumulated jump.
+    d += 0.10f;
+    hs.delta = Vec3{d, 0.0f, 0.0f};
+    f.link.update(hs, 1700);                   // 600 ms after the mute started
+    ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), moves_before + 1);
+    return true;
+}
+
+// A muted window with a gesture-mute of 0 must behave as if the feature were
+// off: the documented escape hatch, same philosophy as soft_boundary=false.
+TEST(robot_gesture_mute_off_is_the_old_behaviour) {
+    RobotConfig cfg = test_cfg();
+    cfg.gesture_mute_ms = 0;
+    Fixture f(cfg);
+    ASSERT(f.link.connect_if_needed());
+
+    HandState hs = make_hand();
+    hs.delta = Vec3{0.0f, 0.0f, 0.0f};
+    f.link.update(hs, 1000);
+
+    hs.gesture = Gesture::Fist;
+    f.link.update(hs, 1100);
+    ASSERT_EQ(count_cmds(f.fp->requests, "gripper"), static_cast<int64_t>(1));
+
+    // No window, so the very next moving frame goes straight out.
+    const int64_t moves_before = count_cmds(f.fp->requests, "movexyz");
+    hs.delta = Vec3{0.10f, 0.0f, 0.0f};
+    f.link.update(hs, 1200);
+    ASSERT_EQ(count_cmds(f.fp->requests, "movexyz"), moves_before + 1);
     return true;
 }

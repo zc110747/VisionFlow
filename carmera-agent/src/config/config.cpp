@@ -280,6 +280,8 @@ bool load_config(Config& cfg, const std::string& path) {
         cfg.robot.home_on_presence =
             as_bool(find(*n, "home_on_presence"), cfg.robot.home_on_presence);
         cfg.robot.lost_frames  = as_int(find(*n, "lost_frames"), cfg.robot.lost_frames);
+        cfg.robot.gesture_mute_ms =
+            as_int(find(*n, "gesture_mute_ms"), cfg.robot.gesture_mute_ms);
         cfg.robot.log_commands = as_bool(find(*n, "log_commands"), cfg.robot.log_commands);
 
         // Closed vocabularies, same policy the hand depth source uses: an

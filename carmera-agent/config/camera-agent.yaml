@@ -252,5 +252,23 @@ robot:
   home_on_presence: true
   lost_frames: 6                # frames of absence before "the hand left"
 
+  # ---- gesture mute window ------------------------------------------------
+  # After a discrete gesture fires (gripper open/close, or home), continuous
+  # motion is suppressed for this long, and the motion that happened during the
+  # window is DISCARDED (the differencing basis is re-latched when it ends).
+  #
+  # Why: forming a fist is not a still pose. The fingers curl, the landmark box
+  # shrinks and its centre drifts, so the hand's reported position honestly
+  # moves while the operator makes the gesture - and the classifier only
+  # confirms 5 frames later (~625 ms at the hand branch's ~8 Hz). So a fist
+  # produces several frames of perfectly followable hand motion BEFORE it is
+  # recognised as a gesture, and the arm used to follow all of it: measured on
+  # hardware, the arm visibly walked away while the fist was forming.
+  #
+  # The operator's intent is "make a switch, do not move". 500 ms covers the
+  # confirm window plus the curl. Raise it if the arm still creeps on a fist;
+  # lower it if gestures feel like they freeze the arm for too long.
+  gesture_mute_ms: 500
+
   log_commands: true            # log every command result (raw protocol text)
 

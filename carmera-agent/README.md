@@ -693,6 +693,70 @@ X 轴: axis_scale = (175.88 - 40.46) / 0.5 = 270.85
 **为什么不直接改成绝对模式**：`--robot-map absolute` 也能避开累积拒绝，但语义变成"指着走"，
 丢掉了跟手的手感。软边界保留跟手，只是让臂在边界处安静下来。
 
+### 🔴 `delta` 必须帧间差分（累积量 vs 增量的语义错位）
+
+**症状**：手持续移动时，臂**不是一直生效** —— 中间像卡住（抖动），然后**突然蹿一大步**。
+
+**根因**：`HandState::delta` 的语义是**累积量**：
+
+```
+delta = position - reference        // reference 只在首次稳定时锁存一次，之后永不更新
+```
+
+而 `RobotLink::step()` 把它当**帧间增量**直接用（`raw_x = hs.delta.y * gain_x`）。
+于是**手停住不动时，同一份位移每帧都被重新发一遍**：
+
+```
+帧 1  手 moveref帧1  手移动 1cm  delta=0.02  →  发 0.02
+帧 2  手不动          delta=0.02  →  又发 0.02   ❌
+帧 3  手不动          delta=0.02  →  再发 0.02   ❌
+```
+
+每一帧的 0.02 换算成 X 轴步长约 0.39mm，**低于 `deadzone_mm = 0.5`** ⇒ 被跳过 → 看起来"卡住"。
+一旦某帧手稍微动一下把步长顶过 0.5mm，臂就动一步 —— 但基准没变，**下一帧继续重发**，
+累积起来就是"突然蹿一大步"。
+
+这解释了为什么**测试全绿但真机不对**：参考实现 `gesture_bridge.py::nudge(delta)` 接收的是
+**调用方算好的帧间增量**，两端语义从一开始就不一致。
+
+**修法**：在 `RobotLink` 内做**帧间差分** `increment = delta_now − delta_prev`
+（等价于 `position_now − position_prev`，手不动时恰好为 0）。架构边界干净：
+`HandState` 保持只读、纯逐帧上报，metadata / Web UI 的 delta 消费者完全不受影响。
+
+三条不变式：
+
+| 情形 | 行为 | 理由 |
+|---|---|---|
+| **第一帧** | 只锁基准、**不发命令** | 没有前驱可减；从 0 起算会把整段累积偏移当成一步发出 —— 正是要修的跳变 |
+| **被限流丢掉的帧** | 基准**照常推进**、只是不发 | 否则这一帧的运动被"攒"着，下一帧一次性补发（也是"突然运动"） |
+| **参考点未锁存** | 基准**不推进** | 锁存前的 delta 属于被丢弃的窗口，不能成为第一步的原点 |
+
+> 实现落在 `have_prev_delta_` / `prev_delta_[3]`（worker 线程私有），限流判定被**移到差分之后**
+> —— 限流器只决定「这帧发不发」，从不决定「手有没有动」。手离开再回来时一并复位
+> （回来的手是**新原点**，拿旧基准会算出两段无关位置的差）。
+
+### 手势要的是「开关」，不是「运动」（`gesture_mute_ms`）
+
+**症状**：握拳 → 夹爪闭合的同时臂也在平动；张开同理。操作者只想让它**开关**。
+
+**根因**：**握拳不是静止姿态** —— 手指收拢的过程中 landmark 包围盒缩小、中心漂移，
+所以 `position` 在真实地移动；再加上分类器要 `gesture_confirm_frames = 5` 帧
+（约 **625 ms** @ 8Hz）才确认手势，这期间有**好几帧"真实可跟随"的手部运动**被机械臂跟了。
+
+**修法**：`gesture_mute_ms` **静默窗口**（默认 **500 ms**，即"手势确认 + 0.5 秒"）。
+
+- 手势**上升沿**触发时置 `muted_until_ms_ = now + mute_ms`；
+- 窗口内连续运动被抑制；
+- 窗口内**每帧刷新差分基准** ⇒ 等于**丢弃**窗口内位移，避免窗口结束时一次性补发成大跳。
+
+```
+握拳确认 ─┬─ gripper close  (1 条)
+          └─ 静默 500ms：位移全丢，基准每帧重锁
+              └─ 窗口结束：从当前手位继续跟手，不补发
+```
+
+`gesture_mute_ms = 0` 即回到旧行为（有对应测试 `robot_gesture_mute_off_is_the_old_behaviour`）。
+
 ### 七条协议坑（逐条有对应处理与测试）
 
 | # | 坑 | 处理 |
@@ -813,7 +877,7 @@ ctest --test-dir build-msvc --output-on-failure
 ctest --test-dir build --output-on-failure
 ```
 
-覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、**运行时 AI 模式切换（Detect↔Pose、Detect↔Hand 不重启）**、手部（anchor 全 2016 值核对、黄金图 21 点亚毫像素比对、坐标映射/EMA/reference/deadzone/手势去抖、hand 报文逐字节固定）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）、**手势真机数据回归（实测开掌/握拳 landmark 逐位冻结，钉住 `kCurledRatio`）**、**机器人控制（`RobotLink` 状态机 + 七条协议坑、合成序列对已知几何真值、真实帧鲁棒性、真 socket 直驱 sim 臂并断言**臂真的位移**、软边界（曲线/贴边减速/关闭即旧行为/**实测 span 基准**/**拒绝后细探**/**细探开关**）、后端不可达重试与自愈、**交付手感（`gain` 默认值 + 降幅步长表被算术钉住、yaml 与内置默认一致）**）**。**85/85 通过**（sim / gstreamer / LIVE 三模式各跑一遍）。
+覆盖：摄像头枚举、管线创建、H264 编码、RTSP 连接、RTSP 断开、自动重连（退避 `1/2/5/10s` 封顶验证）、参数错误、正常退出、AI 端到端（detector 真图检出 + ByteTrack 稳定 ID + AIPipeline 生命周期）、YOLO11 解码（通道数判型、双布局合成张量、pose 17 关键点逆变换/conf 不二次 sigmoid）、pose 真模型回归（yolo11n-pose bus.jpg 4 人 17 关键点全落帧内）、**运行时 AI 模式切换（Detect↔Pose、Detect↔Hand 不重启）**、手部（anchor 全 2016 值核对、黄金图 21 点亚毫像素比对、坐标映射/EMA/reference/deadzone/手势去抖、hand 报文逐字节固定）、Metadata 端到端（JSON 字段与 bbox 裁剪、空结果、心跳、有界队列、断服不阻塞、恢复后重连计数、配置解析）、**手势真机数据回归（实测开掌/握拳 landmark 逐位冻结，钉住 `kCurledRatio`）**、**机器人控制（`RobotLink` 状态机 + 七条协议坑、合成序列对已知几何真值、真实帧鲁棒性、真 socket 直驱 sim 臂并断言**臂真的位移**、软边界（曲线/贴边减速/关闭即旧行为/**实测 span 基准**/**拒绝后细探**/**细探开关**）、后端不可达重试与自愈、**交付手感（`gain` 默认值 + 降幅步长表被算术钉住、yaml 与内置默认一致）**、**`delta` 帧间差分（累积量不可逐帧重发、限流帧仍推进基准、未锁参考点不推进基准）**、**手势静默窗口（握拳/张开只开关不平动、窗口内丢弃位移、关闭即旧行为）**）**。**88/88 通过**（sim / gstreamer / LIVE 三模式各跑一遍）。
 
 ### 2. 端到端验收（`scripts/e2e-test.ps1`，真实 GStreamer 后端）
 
@@ -1052,7 +1116,7 @@ Camera (mfvideosrc 1280x720@30)
 ### 单元测试（无头端到端）
 
 `tests/ai_detector_tests.cpp` 三个用例（已合入 ctest；含本节在内当时总计 76 个用例，
-后续加入机器人/软边界等用例后当前总数为 **85/85**）：
+后续加入机器人/软边界/`delta` 差分等用例后当前总数为 **88/88**）：
 
 - `ai_detector_bus_image`：在 Ultralytics 官方 `bus.jpg` 上跑真模型，断言 ≥1 个 person、bbox 全在 `[0,w]×[0,h]` 内。**实测 4 个 person**。
 - `ai_tracker_stable_ids`：3 帧直线漂移的合成检测 → 1 个稳定 track id。
@@ -1249,7 +1313,7 @@ std::unique_ptr<IMetadataTransport> create_metadata_transport(const MetadataConf
 | 5 | **AI 异常** | 模型路径故意填错 `models/does-not-exist.onnx` + `--ai --metadata`（`--source videotestsrc`） | 日志 `[AI] model file not found` → `[AI] model init failed (...), video stream continues without AI` → `[warning] [AI] not started; video stream is unaffected`；视频全程 `STREAMING`（frames=424 `dropped=0` bitrate≈4070kbps），AI 不产出结果 → metadata 只剩心跳（`sent=3`，无 `frame` 消息）；mock 收到 cam_t5 共 3 条；agent 正常退出（exit=0） |
 | 6 | **AI 关闭** | `--no-ai --metadata`（`--source videotestsrc`） | 视频正常 `STREAMING`（frames=426 `dropped=0` bitrate≈3897kbps）；管线不含 tee/aisplit（AI 分支完全不挂载）；metadata 仅发心跳（每 5s 一条，`sent=3`，mock 收到 cam_t6 共 3 条）；agent 正常退出（exit=0） |
 
-单元测试全部通过（撰写本节时为 **76/76**，当前为 **85/85**）；下表为 Metadata 分支直接相关的 9 个（手部用例见 `tests/hand_wiring_tests.cpp`）：
+单元测试全部通过（撰写本节时为 **76/76**，当前为 **88/88**）；下表为 Metadata 分支直接相关的 9 个（手部用例见 `tests/hand_wiring_tests.cpp`）：
 
 | 用例 | 断言要点 |
 |------|----------|

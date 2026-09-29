@@ -177,10 +177,14 @@ TEST(robot_live_backend_drives_sim_arm) {
     ASSERT(link.connected());
 
     // (e) A tiny delta must be skipped WITHOUT a transport fault (pitfall 1).
-    hs.reference = hs.position;
-    hs.delta = ca::Vec3{0.0001f, 0.0f, 0.0f};
+    //     `delta` is CUMULATIVE, so "tiny" means a tiny change from the previous
+    //     frame, not a tiny absolute value: setting it to ~0 here would read as
+    //     a large negative step and be sent, not skipped. Hold the basis and
+    //     advance it by a hair. The timestamp is pushed past the 15 Hz period so
+    //     the rate limiter cannot be what swallows the frame.
+    hs.delta = ca::Vec3{0.3f + 0.0001f, 0.0f, 0.0f};
     const int64_t skipped_before = link.commands_skipped();
-    ASSERT(link.update(hs, 1150));
+    ASSERT(link.update(hs, 1200));
     ASSERT(link.commands_skipped() > skipped_before);
 
     // (f) The link must have stayed up through all of it.
@@ -230,7 +234,7 @@ TEST(robot_live_backend_drives_sim_arm) {
         // arm should travel and then ease into the edge.
         ca::HandState push = hand_at(0.5f, 0.5f, 0.5f);
         push.reference = push.position;
-        push.delta = ca::Vec3{0.0f, 0.05f, 0.0f};
+        push.delta = ca::Vec3{0.0f, 0.0f, 0.0f};
 
         // Track the reported pose so "did the arm actually move?" can be
         // asserted rather than inferred. Before the fix this was the missing
@@ -241,8 +245,13 @@ TEST(robot_live_backend_drives_sim_arm) {
 
         int64_t t = 2000;
         ca::Vec3 prev = tcp_start;
+        // `delta` is cumulative, so a steady push means ADVANCING it by 0.05
+        // every frame. Re-sending the same value would read as "the hand stopped"
+        // and correctly produce no motion after the first frame.
+        float pushed = 0.0f;
         for (int i = 0; i < 25; ++i) {
-            push.reference = push.position;
+            pushed += 0.05f;
+            push.delta = ca::Vec3{0.0f, pushed, 0.0f};
             link.update(push, t);
             const ca::Vec3 now = link.last_tcp();
             travelled += std::fabs(now.x - prev.x);
