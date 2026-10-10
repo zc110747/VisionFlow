@@ -1,0 +1,81 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>VisionFlow.Desktop</RootNamespace>
+    <AssemblyName>VisionFlow.Desktop</AssemblyName>
+
+    <!-- 零警告基线 -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningLevel>9999</WarningLevel>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+
+    <!-- 允许 WinForms 设计器与 unsafe（FFmpeg 指针操作必需） -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- 平台：WinForms + D3D11 硬解只支持 x64 -->
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PlatformTarget>x64</PlatformTarget>
+
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+    <!-- DPI 感知：视频渲染与 AI 叠加坐标都依赖正确的缩放比。
+         注意 .NET 9 WinForms 起禁止在 manifest 里写 dpiAware（WFO0003），
+         必须走这个项目属性。 -->
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ApplicationVisualStyles>true</ApplicationVisualStyles>
+    <ApplicationUseCompatibleTextRendering>false</ApplicationUseCompatibleTextRendering>
+    <ApplicationDefaultFont>Microsoft YaHei UI, 9pt</ApplicationDefaultFont>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- ⚠ 版本对齐是硬约束，不要随手升级其中一边。
+         FFmpeg.AutoGen 内部用编译期常量 LIBAV*_VERSION_MAJOR 拼 DLL 名加载
+         （avutil-60.dll 这种固定名），所以包版本必须与本机 ffmpeg 运行库
+         **主版本严格一致**，差 1 即失败，症状是调用任何 av_* 函数时抛
+         NotSupportedException: Specified method is not supported。
+
+         对齐关系（改依赖前先核对）：
+           AutoGen 8.0.0 → FFmpeg 8.0/8.1：avutil-60 avcodec-62 avformat-62
+                                            swscale-9 avfilter-11 swresample-6
+           FFmpeg 9.0/master            ：avutil-61 avcodec-63 avformat-63
+                                            swscale-10 avfilter-12 swresample-7
+           FFmpeg 7.1                   ：avutil-59 avcodec-61 avformat-61
+                                            swscale-8 avfilter-10 swresample-5
+
+         本项目锁定：AutoGen 8.0.0 + ffmpeg-n8.1 gpl-shared（见下方 FFmpegRoot）。 -->
+    <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0" />
+  </ItemGroup>
+
+  <!-- 本机 ffmpeg shared build 位置。
+       允许用环境变量 FFMPEG_ROOT 覆盖，未设置时回落到默认开发路径。
+       运行时由 FFmpegLoader 做版本对齐校验，构建期只校验文件存在。 -->
+  <PropertyGroup>
+    <FFmpegRoot Condition="'$(FFmpegRoot)' == '' AND '$(FFMPEG_ROOT)' != ''">$(FFMPEG_ROOT)</FFmpegRoot>
+    <FFmpegRoot Condition="'$(FFmpegRoot)' == ''">D:\data\agent-tools\ffmpeg-n8.1-latest-win64-gpl-shared</FFmpegRoot>
+    <FFmpegBinDir>$(FFmpegRoot)\bin</FFmpegBinDir>
+  </PropertyGroup>
+
+  <Target Name="VerifyFFmpegPresent" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(FFmpegBinDir)\avcodec-62.dll')"
+           Text="找不到与 FFmpeg.AutoGen 8.0.0 对齐的 ffmpeg 运行库：$(FFmpegBinDir)\avcodec-62.dll。请设置环境变量 FFMPEG_ROOT 指向 ffmpeg 8.0/8.1 shared build 根目录（需要 avutil-60 / avcodec-62）。" />
+  </Target>
+
+  <!-- 把 ffmpeg 运行时 DLL 拷到输出目录，保证 F5 / 直接运行都能加载 -->
+  <Target Name="CopyFFmpegRuntime" AfterTargets="Build">
+    <ItemGroup>
+      <FFmpegDll Include="$(FFmpegBinDir)\*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(FFmpegDll)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="[FFmpeg] 已复制 @(FFmpegDll->Count()) 个运行库 → $(OutDir)" />
+  </Target>
+
+</Project>
