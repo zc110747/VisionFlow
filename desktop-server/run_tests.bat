@@ -106,11 +106,37 @@ if !errorlevel! equ 0 (
 )
 
 REM ---------- 7. AI overlay rendering ----------
-echo [7/7] AI overlay rendering and skeleton topology
+echo [7/8] AI overlay rendering and skeleton topology
 "%EXE%" --overlaytest --out "%TEMP%\vf_a6" > "%LOG%" 2>&1
 call :Check "overlay probe succeeded" !errorlevel! 0
 call :Assert "all overlay assertions pass" "RESULT verdict=PASS"
 call :Assert "zero overlay failures"       "RESULT failures=0"
+
+REM ---------- 8. AI overlay on real decoded frame ----------
+echo [8/8] AI overlay composited onto real decoded frame
+"%EXE%" --realframe "%DATA%\h264_720p.mp4" --frames 5 --out "%TEMP%\vf_a7" > "%LOG%" 2>&1
+if !errorlevel! equ 2 (
+    echo   SKIP  test video absent (realframe probe)
+    set /a SKIP+=1
+) else (
+    call :Check "realframe probe succeeded" !errorlevel! 0
+    call :Assert "overlay on real frame verdict PASS" "RESULT verdict=PASS"
+    call :Assert "zero realframe failures"          "RESULT failures=0"
+)
+
+REM ---------- 9. Camera cross-thread event regression ----------
+echo [9/9] Camera cross-thread event marshaling regression
+"%EXE%" --threadtest > "%LOG%" 2>&1
+if !errorlevel! equ 2 (
+    echo   SKIP  no local camera for threadtest
+    set /a SKIP+=1
+) else (
+    call :Check "threadtest probe succeeded" !errorlevel! 0
+    call :Assert "no cross-thread exceptions"      "RESULT phaseA_exceptions=0"
+    call :Assert "handler runs on UI thread"        "RESULT handler_on_ui_thread="
+    call :Assert "worker-thread event confirmed"    "RESULT phaseB_worker_thread_event=True"
+    call :Assert "threadtest verdict PASS"          "RESULT verdict=PASS"
+)
 
 echo.
 echo ============================================

@@ -133,6 +133,21 @@ internal static class Program
             }
         }
 
+        // 跨线程事件回归：--threadtest
+        // 用真实 CameraPreviewController 在后台线程触发 RunningChanged/Ended，
+        // 验证 MainForm 引入的 BeginInvoke 封送不会导致跨线程 InvalidOperationException。
+        if (args.Any(a => string.Equals(a, "--threadtest", StringComparison.OrdinalIgnoreCase)))
+        {
+            try
+            {
+                return ThreadingRegressionProbe.Run(null);
+            }
+            finally
+            {
+                Capture.CameraEnumerator.Shutdown();
+            }
+        }
+
         // 网络相机对接验收：--nettest [--url URL] [--camera ID] [--setmode MODE]
         int netIdx = Array.FindIndex(args,
             a => string.Equals(a, "--nettest", StringComparison.OrdinalIgnoreCase));
@@ -173,6 +188,45 @@ internal static class Program
             }
 
             return OverlayProbe.Run(ovOut);
+        }
+
+        // AI 叠加落在实际解码帧验收：--realframe <输入> [--frames N] [--out DIR]
+        int rfIdx = Array.FindIndex(args,
+            a => string.Equals(a, "--realframe", StringComparison.OrdinalIgnoreCase));
+        if (rfIdx >= 0)
+        {
+            string? rfInput = null;
+            if (rfIdx + 1 < args.Length &&
+                !args[rfIdx + 1].StartsWith("--", StringComparison.OrdinalIgnoreCase))
+            {
+                rfInput = args[rfIdx + 1];
+            }
+
+            int rfFrames = 5;
+            int rfFIdx = Array.FindIndex(args, a => string.Equals(a, "--frames", StringComparison.OrdinalIgnoreCase));
+            if (rfFIdx >= 0 && rfFIdx + 1 < args.Length && int.TryParse(args[rfFIdx + 1], out int rf))
+            {
+                rfFrames = rf;
+            }
+
+            string? rfOut = null;
+            int rfOIdx = Array.FindIndex(args, a => string.Equals(a, "--out", StringComparison.OrdinalIgnoreCase));
+            if (rfOIdx >= 0 && rfOIdx + 1 < args.Length)
+            {
+                rfOut = args[rfOIdx + 1];
+            }
+
+            try
+            {
+                FFmpegLoader.Initialize();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"ffmpeg 初始化失败: {ex.Message}");
+                return 1;
+            }
+
+            return RealFrameOverlayProbe.Run(rfInput, rfFrames, rfOut);
         }
 
         // GUI 取证：--guicapture [--process NAME] [--out FILE] [--wait SEC]

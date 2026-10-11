@@ -122,6 +122,14 @@ internal sealed class MainForm : Form
                  s.Input.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
             {
                 Log($"[取证] 自动选中 #{i}: {s.Display}");
+
+                if (_sourceCombo.SelectedIndex == i)
+                {
+                    // 目标已是当前选中项：SelectedIndexChanged 不会触发，直接启动
+                    StartSource(s);
+                    return;
+                }
+
                 _sourceCombo.SelectedIndex = i;
                 return;
             }
@@ -263,13 +271,11 @@ internal sealed class MainForm : Form
 
         _camera.Log += Log;
         _camera.FrameReady += SubmitFrame;
+        // 注意：RunningChanged / Ended 由采集工作线程触发，
+        // 其处理器内部会访问 UI 控件 / MessageBox，必须回到 UI 线程执行，
+        // 否则抛 InvalidOperationException（跨线程操作无效）——即“显示线程异常”。
         _camera.RunningChanged += OnCameraRunningChanged;
-        _camera.Ended += reason =>
-        {
-            SetStatus($"采集结束：{reason}");
-            MessageBox.Show(this, reason, "摄像头预览结束",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        };
+        _camera.Ended += OnCameraEnded;
     }
 
     private void SubmitFrame(Bitmap frame)
@@ -285,6 +291,13 @@ internal sealed class MainForm : Form
 
     private void OnPlayerPlayingChanged(bool playing)
     {
+        // PlayingChanged 由播放工作线程触发，回 UI 线程后再碰控件。
+        if (!IsDisposed && InvokeRequired)
+        {
+            BeginInvoke(() => OnPlayerPlayingChanged(playing));
+            return;
+        }
+
         if (IsDisposed)
         {
             return;
@@ -298,6 +311,13 @@ internal sealed class MainForm : Form
 
     private void OnCameraRunningChanged(bool running)
     {
+        // RunningChanged 由采集工作线程触发，回 UI 线程后再碰控件。
+        if (!IsDisposed && InvokeRequired)
+        {
+            BeginInvoke(() => OnCameraRunningChanged(running));
+            return;
+        }
+
         if (IsDisposed)
         {
             return;
@@ -308,6 +328,35 @@ internal sealed class MainForm : Form
         _playPauseButton.Text = "暂停";
         _stopButton.Enabled = running;
         SetStatus(running ? "摄像头预览中" : "摄像头已停止");
+
+        // 设备打开成功（工作线程内完成，此时 Capture 已就绪）→ 回填协商出的格式
+        if (running)
+        {
+            var cap = _camera.Capture;
+            if (cap is not null)
+            {
+                _backendLabel.Text = $"后端: 摄像头采集 ({cap.Width}x{cap.Height} {cap.PixelFormat})";
+            }
+        }
+    }
+
+    private void OnCameraEnded(string reason)
+    {
+        // Ended 由采集工作线程触发，MessageBox.Show(this, ...) 必须在 UI 线程执行。
+        if (!IsDisposed && InvokeRequired)
+        {
+            BeginInvoke(() => OnCameraEnded(reason));
+            return;
+        }
+
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        SetStatus($"采集结束：{reason}");
+        MessageBox.Show(this, reason, "摄像头预览结束",
+            MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
     // ── 源管理 ──────────────────────────────────────────────────────
@@ -564,6 +613,8 @@ internal sealed class MainForm : Form
     {
         _sourceKindLabel.Text = "源: 本地摄像头";
 
+        // 设备打开是异步的（在采集工作线程内完成，MF COM 对象严禁跨 apartment 使用）：
+        // Start 只负责拉起工作线程；打开结果经 RunningChanged/Ended 事件回 UI 线程。
         if (!_camera.Start(item.DeviceIndex))
         {
             SetStatus("摄像头打开失败");
@@ -574,9 +625,8 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var cap = _camera.Capture!;
         _stopButton.Enabled = true;
-        _backendLabel.Text = $"后端: 摄像头采集 ({cap.Width}x{cap.Height} {cap.PixelFormat})";
+        _backendLabel.Text = "后端: 摄像头打开中…";
     }
 
     private void StartPlayer(SourceItem item)
