@@ -1,54 +1,49 @@
 using System.Diagnostics;
-using VisionFlow.Desktop.Network;
+using VisionFlow.Desktop.Server;
 
 namespace VisionFlow.Desktop.Ai;
 
 /// <summary>
-/// AI 数据轮询器。按固定间隔拉取某相机的 metadata 快照并推送事件。
+/// AI 数据轮询器。
 ///
-/// <para><b>为什么是轮询而不是长连接/WebSocket</b></para>
+/// <para><b>为什么是进程内轮询而不是 HTTP</b></para>
 /// <para>
-/// video-server 的 metadata 是「最新值」语义（<c>GET /api/cameras/{id}/metadata</c>
-/// 返回最新一帧 + 最新心跳），不是事件流。服务端也没有为 AI 提供推送通道
-/// ——agent 侧同样靠轮询拿 AI 模式。因此轮询是该架构下的自然选择，
-/// 与现有服务端能力一致，不需要改动 video-server。
+/// 改造前本端是 video-server 的**客户端**，只能通过
+/// <c>GET /api/cameras/{id}/metadata</c> 拉数据，因此必须走 HTTP 轮询。
+/// 现在 metadata 就落在本进程的 <see cref="MetadataServer"/> 里，
+/// 再自己发 HTTP 请求给自己只是绕一圈 loopback——多一次序列化、
+/// 多一个线程、还引入"HTTP 失败但数据其实就在内存里"的假故障。
+/// 因此改成直接读 <see cref="ServerHost.GetOverlayState"/>。
 /// </para>
 ///
-/// <para><b>轮询频率与去重</b></para>
+/// <para><b>保留轮询而不是改事件推送</b></para>
 /// <para>
-/// 默认 150ms（约 6.7Hz）。摄像头 AI 通常跑 15~30fps，
-/// 更高的轮询频率只会重复拿到同一个 <c>frame_id</c>，
-/// 徒增请求量。因此按 <c>frame_id</c> 去重：只有帧真正变化才推送
-/// <see cref="FrameUpdated"/>；心跳变化单独推送 <see cref="StatusUpdated"/>。
+/// <see cref="MetadataServer.StateChanged"/> 只说明"内存变了"，
+/// 但它每次 metadata 都触发（含去重前的重复帧），而 UI 需要的语义是
+/// "有新帧时刷新画面"。保持 150ms 定时拉取，配合 <c>frame_id</c> 去重，
+/// 逻辑与改造前完全一致——差异只在数据来源，不在时序行为，
+/// 这样已有的验收脚本判据不需要重写。
 /// </para>
 /// </summary>
 internal sealed class AiMetadataPoller : IDisposable
 {
-    /// <summary>
-    /// 轮询间隔。150ms 是在「及时性」与「请求量」之间的折中：
-    /// 30fps 下每帧 33ms，150ms 约等于每 4~5 帧取一次，
-    /// 足以让叠加框看起来跟手，又把请求压到 ≈6.7 req/s。
-    /// </summary>
+    /// <summary>轮询间隔，与改造前的 HTTP 轮询保持一致。</summary>
     public static readonly TimeSpan DefaultInterval = TimeSpan.FromMilliseconds(150);
 
     /// <summary>数据超过该时长未更新则视为失效（agent 可能已停）。</summary>
     public static readonly TimeSpan StaleThreshold = TimeSpan.FromSeconds(3);
 
-    private readonly NetworkCameraClient _client;
+    private readonly ServerHost _server;
     private readonly object _sync = new();
     private CancellationTokenSource? _cts;
     private Thread? _worker;
     private bool _disposed;
 
     private long _lastFrameId = -1;
-    private long _consecutiveFailures;
 
-    /// <summary>该 poller 对应的相机 ID。</summary>
-    private string _cameraId = string.Empty;
-
-    public AiMetadataPoller(NetworkCameraClient client)
+    public AiMetadataPoller(ServerHost server)
     {
-        _client = client;
+        _server = server;
     }
 
     /// <summary>新的 AI 帧到达（frame_id 变化时触发）。</summary>
@@ -60,7 +55,7 @@ internal sealed class AiMetadataPoller : IDisposable
     /// <summary>日志。</summary>
     public event Action<string>? Log;
 
-    /// <summary>连续失败达到阈值（服务不可达 / 相机不存在）。</summary>
+    /// <summary>连续失败达到阈值（相机不存在 / 服务器未启动）。</summary>
     public event Action<string>? Failed;
 
     /// <summary>是否正在轮询。</summary>
@@ -69,7 +64,7 @@ internal sealed class AiMetadataPoller : IDisposable
     /// <summary>最近一次成功获取的状态。</summary>
     public AiOverlayState? Latest { get; private set; }
 
-    /// <summary>轮询间隔（可调，便于测试）</summary>
+    /// <summary>轮询间隔（可调，便于测试）。</summary>
     public TimeSpan Interval { get; set; } = DefaultInterval;
 
     /// <summary>开始轮询指定相机。</summary>
@@ -79,9 +74,7 @@ internal sealed class AiMetadataPoller : IDisposable
 
         lock (_sync)
         {
-            _cameraId = cameraId;
             _lastFrameId = -1;
-            _consecutiveFailures = 0;
             _cts = new CancellationTokenSource();
             var token = _cts.Token;
 
@@ -98,24 +91,25 @@ internal sealed class AiMetadataPoller : IDisposable
 
     private void PollLoop(string cameraId, CancellationToken token)
     {
-        Log?.Invoke($"[AI] 开始轮询 {cameraId}，间隔 {Interval.TotalMilliseconds:F0}ms");
+        Log?.Invoke($"[AI] 开始轮询 {cameraId}，间隔 {Interval.TotalMilliseconds:F0}ms（进程内）");
 
         var sw = Stopwatch.StartNew();
-        long requests = 0;
+        long polls = 0;
+        int consecutiveMisses = 0;
 
         while (!token.IsCancellationRequested)
         {
-            var snap = _client.GetMetadata(cameraId);
-            requests++;
+            var state = _server.GetOverlayState(cameraId);
+            polls++;
 
-            if (snap is null)
+            if (state is null)
             {
-                _consecutiveFailures++;
+                consecutiveMisses++;
 
-                // 连续失败 10 次（约 1.5s）才上报，避免服务抖动时刷屏
-                if (_consecutiveFailures == 10)
+                // 连续 10 次（约 1.5s）才上报，避免启动瞬间刷屏
+                if (consecutiveMisses == 10)
                 {
-                    Failed?.Invoke($"AI 数据获取连续失败：{_client.LastError}");
+                    Failed?.Invoke($"相机 {cameraId} 无 AI 数据（服务器未启动或 agent 未上报）");
                 }
 
                 if (token.WaitHandle.WaitOne(Interval))
@@ -126,34 +120,32 @@ internal sealed class AiMetadataPoller : IDisposable
                 continue;
             }
 
-            if (_consecutiveFailures > 0)
+            if (consecutiveMisses > 0)
             {
-                Log?.Invoke($"[AI] 轮询恢复正常（此前连续失败 {_consecutiveFailures} 次）");
-                _consecutiveFailures = 0;
+                Log?.Invoke($"[AI] 轮询恢复正常（此前连续缺失 {consecutiveMisses} 次）");
+                consecutiveMisses = 0;
             }
 
-            var state = AiOverlayState.FromSnapshot(cameraId, snap);
             Latest = state;
 
             // 帧去重：只有 frame_id 变化才算新帧
-            if (snap.Frame is not null && state.FrameId != _lastFrameId)
+            if (state.FrameId != _lastFrameId)
             {
                 _lastFrameId = state.FrameId;
                 FrameUpdated?.Invoke(state);
             }
 
             // 心跳每次都推（fps 等是连续值，需要刷新显示）
-            if (snap.Status is not null)
+            if (state.Running)
             {
                 StatusUpdated?.Invoke(state);
             }
 
-            // 每 5 秒报一次轮询统计，便于判断轮询是否健康
             if (sw.Elapsed.TotalSeconds >= 5)
             {
-                double rate = requests / sw.Elapsed.TotalSeconds;
-                Log?.Invoke($"[AI] 轮询 {rate:F1} req/s，最新 frame_id={_lastFrameId}");
-                requests = 0;
+                double rate = polls / sw.Elapsed.TotalSeconds;
+                Log?.Invoke($"[AI] 轮询 {rate:F1} 次/s，最新 frame_id={_lastFrameId}");
+                polls = 0;
                 sw.Restart();
             }
 
@@ -185,8 +177,8 @@ internal sealed class AiMetadataPoller : IDisposable
         {
             cts.Cancel();
 
-            // 单次请求最多等 2s（HttpClient 超时）
-            worker?.Join(TimeSpan.FromSeconds(3));
+            // 进程内读取不阻塞，线程应立即退出
+            worker?.Join(TimeSpan.FromSeconds(1));
             cts.Dispose();
         }
     }

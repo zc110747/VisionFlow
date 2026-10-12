@@ -78,12 +78,39 @@ internal static class GuiCapture
         Process? target = null;
         var deadline = DateTime.UtcNow.AddSeconds(waitSeconds);
 
+        // CAUTION: --guicapture runs as VisionFlow.Desktop.exe too, so a plain
+        // GetProcessesByName("VisionFlow.Desktop") includes THIS process. Taking
+        // list[0] then races against our own PID: when we win, the "target" has
+        // no top-level window and the capture fails with "进程没有可见的顶层窗口".
+        // Skip ourselves explicitly; also prefer a process that actually owns a
+        // top-level window over one that merely exists.
+        int selfId = Environment.ProcessId;
+
         while (DateTime.UtcNow < deadline)
         {
-            var list = Process.GetProcessesByName(processName);
-            if (list.Length > 0)
+            var candidates = Process.GetProcessesByName(processName)
+                                    .Where(p => p.Id != selfId)
+                                    .ToArray();
+
+            // Prefer a candidate that already has a visible top-level window.
+            foreach (var p in candidates)
             {
-                target = list[0];
+                if (FindLargestTopLevelWindow((uint)p.Id, out _) != IntPtr.Zero)
+                {
+                    target = p;
+                    break;
+                }
+            }
+
+            // Fall back to any candidate (its window may still be coming up);
+            // the wait loop below keeps polling for the window.
+            if (target is null && candidates.Length > 0)
+            {
+                target = candidates[0];
+            }
+
+            if (target is not null)
+            {
                 break;
             }
 

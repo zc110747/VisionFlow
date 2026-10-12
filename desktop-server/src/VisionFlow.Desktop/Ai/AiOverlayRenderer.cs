@@ -1,7 +1,7 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
-using VisionFlow.Desktop.Network;
 using VisionFlow.Desktop.Rendering;
+using VisionFlow.Desktop.Server;
 
 namespace VisionFlow.Desktop.Ai;
 
@@ -109,7 +109,7 @@ internal static class AiOverlayRenderer
     private static void DrawBox(
         Graphics g,
         VideoTransform transform,
-        ObjectViewDto obj,
+        MetadataObject obj,
         int refW,
         int refH,
         Pen pen)

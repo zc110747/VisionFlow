@@ -1,0 +1,16 @@
+# Batch files MUST keep CRLF line endings.
+#
+# cmd.exe resolves "call :label" by BYTE OFFSET into the script. With
+# LF-only endings the offset arithmetic drifts, and cmd silently
+# re-executes parts of the file (observed: stages 7/8/9 ran 7 times in
+# a single invocation while stages 1-6 ran once). The symptom looks like
+# a logic bug in the script, not a line-ending problem, so it is very
+# easy to misdiagnose.
+#
+# "eol=crlf" makes git check them out with CRLF even if a tool rewrote
+# them with LF (which is exactly what happened here).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Shell / source files stay LF.
+*.sh text eol=lf

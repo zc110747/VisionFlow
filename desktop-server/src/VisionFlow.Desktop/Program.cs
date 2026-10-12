@@ -148,33 +148,31 @@ internal static class Program
             }
         }
 
-        // 网络相机对接验收：--nettest [--url URL] [--camera ID] [--setmode MODE]
-        int netIdx = Array.FindIndex(args,
-            a => string.Equals(a, "--nettest", StringComparison.OrdinalIgnoreCase));
-        if (netIdx >= 0)
+        // 内嵌服务器端到端验收：--servertest [--keep] [--seconds N]
+        // 拉起 MediaMTX + metadata 端点，用 ffmpeg 模拟 agent 推流，
+        // 再走一遍 HTTP 契约与真实解码拉流。
+        if (args.Any(a => string.Equals(a, "--servertest", StringComparison.OrdinalIgnoreCase)))
         {
-            string? netUrl = null;
-            int nuIdx = Array.FindIndex(args, a => string.Equals(a, "--url", StringComparison.OrdinalIgnoreCase));
-            if (nuIdx >= 0 && nuIdx + 1 < args.Length)
+            bool keep = args.Any(a => string.Equals(a, "--keep", StringComparison.OrdinalIgnoreCase));
+
+            int seconds = 20;
+            int sIdx = Array.FindIndex(args, a => string.Equals(a, "--seconds", StringComparison.OrdinalIgnoreCase));
+            if (sIdx >= 0 && sIdx + 1 < args.Length && int.TryParse(args[sIdx + 1], out int s))
             {
-                netUrl = args[nuIdx + 1];
+                seconds = s;
             }
 
-            string? netCamera = null;
-            int ncIdx = Array.FindIndex(args, a => string.Equals(a, "--camera", StringComparison.OrdinalIgnoreCase));
-            if (ncIdx >= 0 && ncIdx + 1 < args.Length)
+            try
             {
-                netCamera = args[ncIdx + 1];
+                FFmpegLoader.Initialize();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"ffmpeg 初始化失败: {ex.Message}");
+                return 1;
             }
 
-            string? netSetMode = null;
-            int nsIdx = Array.FindIndex(args, a => string.Equals(a, "--setmode", StringComparison.OrdinalIgnoreCase));
-            if (nsIdx >= 0 && nsIdx + 1 < args.Length)
-            {
-                netSetMode = args[nsIdx + 1];
-            }
-
-            return NetworkProbe.Run(netUrl, netCamera, netSetMode);
+            return ServerProbe.Run(keep, seconds);
         }
 
         // AI 叠加渲染验收：--overlaytest [--out DIR]

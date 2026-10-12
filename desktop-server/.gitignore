@@ -19,3 +19,14 @@ _*.txt
 # 各探针（--camtest / --overlaytest / --guicapture …）的截图与
 # 样本视频，体积大且可随时重新生成，不入库。
 _testdata/
+
+# ── 内嵌 MediaMTX 二进制 ──────────────────────────────────────
+# 55 MB 的单文件可执行体，不入库；LICENSE 保留以便合规追溯。
+# 缺失时 run_onestep.bat / build_oneclick.bat 会提示从哪里取。
+mediamtx/*.exe
+mediamtx/mediamtx
+
+# ── MediaMTX 运行时生成物 ─────────────────────────────────────
+# 托管时生成的 YAML 与日志，位置随运行环境变化，不入库。
+mediamtx/*.yml
+mediamtx/*.log

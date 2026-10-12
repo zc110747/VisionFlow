@@ -2,9 +2,9 @@ using System.Drawing;
 using System.Windows.Forms;
 using VisionFlow.Desktop.Ai;
 using VisionFlow.Desktop.Capture;
-using VisionFlow.Desktop.Network;
 using VisionFlow.Desktop.Playback;
 using VisionFlow.Desktop.Rendering;
+using VisionFlow.Desktop.Server;
 
 namespace VisionFlow.Desktop.UI;
 
@@ -13,11 +13,20 @@ namespace VisionFlow.Desktop.UI;
 ///
 /// <para><b>已实现</b></para>
 /// <list type="number">
-///   <item>本地视频文件：FFmpeg 硬解优先，失败自动回退软解（阶段 2）</item>
-///   <item>本地摄像头：MF 枚举 + 选中预览，AI 功能显式禁用（阶段 3）</item>
-///   <item>网络相机：对接 video-server REST API（阶段 4）</item>
-///   <item>AI metadata 叠加与模式切换（阶段 5）</item>
+///   <item>本地视频文件：FFmpeg 硬解优先，失败自动回退软解</item>
+///   <item>本地摄像头：MF 枚举 + 选中预览，AI 功能显式禁用</item>
+///   <item>网络相机：<b>本端内嵌服务器</b>接收 agent 推流（不再连 video-server）</item>
+///   <item>AI metadata 解析、叠加绘制与模式切换（走本端 8099 端点）</item>
 /// </list>
+///
+/// <para><b>架构变更说明（重要）</b></para>
+/// <para>
+/// 本窗体曾经通过 <c>NetworkCameraClient</c> 去连 video-server 的 REST API。
+/// 按最新设计，<b>desktop-server 自己就是视频服务器</b>：
+/// <see cref="ServerHost"/> 内嵌托管 MediaMTX（RTSP :8554）并自己提供
+/// metadata / aimode 的 HTTP 端点（:8099），agent 直接推过来。
+/// 因此网络相机这一组数据全部来自本进程，不再依赖任何外部服务。
+/// </para>
 ///
 /// <para><b>呈现路径统一</b></para>
 /// <para>
@@ -41,10 +50,14 @@ internal sealed class MainForm : Form
     private readonly ToolStripStatusLabel _statusLabel = new();
     private readonly ToolStripStatusLabel _backendLabel = new();
     private readonly ToolStripStatusLabel _sourceKindLabel = new();
+    private readonly ToolStripStatusLabel _serverLabel = new();
 
     private readonly PlayerController _player = new();
     private readonly CameraPreviewController _camera = new();
-    private readonly NetworkCameraClient _network = new();
+
+    /// <summary>内嵌视频服务器（MediaMTX + metadata 端点）。</summary>
+    private readonly ServerHost _server = new();
+
     private readonly AiMetadataPoller _aiPoller;
 
     /// <summary>当前 AI 叠加数据（null = 无数据 / 已停止）。</summary>
@@ -80,11 +93,12 @@ internal sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Microsoft YaHei UI", 9f);
 
-        _aiPoller = new AiMetadataPoller(_network);
+        _aiPoller = new AiMetadataPoller(_server);
 
         BuildLayout();
         WirePlayers();
         WireAi();
+        WireServer();
 
         _refreshButton.Click += OnRefreshSources;
         _playPauseButton.Click += OnPlayPause;
@@ -105,7 +119,29 @@ internal sealed class MainForm : Form
 
         if (_autoSelectKeyword is { Length: > 0 } keyword)
         {
-            TryAutoSelect(keyword);
+            // 取证场景下，目标源（如 agent 推流的网络相机）往往在窗口显示之后
+            // 才被 MediaMTX 认出来。只尝试一次会静默落空，截图就抓不到该路径。
+            // 因此按固定间隔重试若干次，直到选中或超时。
+            // 注意：这是纯粹的取证辅助，正常交互路径不依赖它。
+            const int attempts = 20;
+            const int intervalMs = 1000;
+
+            var retry = new System.Windows.Forms.Timer { Interval = intervalMs };
+            int left = attempts;
+            retry.Tick += (_, _) =>
+            {
+                // 先刷新再匹配：目标源可能在这 1 秒内才被 MediaMTX 认出来并入列。
+                // SelectPreservingCurrent 会在重建列表时尽量保住当前选中项，
+                // 因此不会把已经开始的播放打断。
+                RefreshSources(autoPlay: false);
+
+                if (TryAutoSelect(keyword) || --left <= 0)
+                {
+                    retry.Stop();
+                    retry.Dispose();
+                }
+            };
+            retry.Start();
         }
     }
 
@@ -113,7 +149,8 @@ internal sealed class MainForm : Form
     /// 按关键字自动选中一个可选源（仅用于 GUI 取证，便于截到非默认路径的状态）。
     /// 匹配 Display 或 Input，取第一个命中的。
     /// </summary>
-    private void TryAutoSelect(string keyword)
+    /// <returns>找到并已选中返回 true；未找到返回 false（供调用方重试）。</returns>
+    private bool TryAutoSelect(string keyword)
     {
         for (int i = 0; i < _sourceCombo.Items.Count; i++)
         {
@@ -127,15 +164,15 @@ internal sealed class MainForm : Form
                 {
                     // 目标已是当前选中项：SelectedIndexChanged 不会触发，直接启动
                     StartSource(s);
-                    return;
+                    return true;
                 }
 
                 _sourceCombo.SelectedIndex = i;
-                return;
+                return true;
             }
         }
 
-        Log($"[取证] 未找到匹配「{keyword}」的源，保持默认选择");
+        return false;
     }
 
     private void BuildLayout()
@@ -242,9 +279,11 @@ internal sealed class MainForm : Form
         _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
         _backendLabel.Text = "后端: -";
         _sourceKindLabel.Text = "源: -";
+        _serverLabel.Text = "服务器: -";
         _statusStrip.Items.Add(_statusLabel);
         _statusStrip.Items.Add(_sourceKindLabel);
         _statusStrip.Items.Add(_backendLabel);
+        _statusStrip.Items.Add(_serverLabel);
         _statusStrip.Dock = DockStyle.Bottom;
 
         Controls.Add(split);
@@ -428,52 +467,26 @@ internal sealed class MainForm : Form
                 }
             }
 
-            // ── 网络相机 ──
+            // ── 网络相机（来自本端内嵌服务器）──
             _sourceCombo.Items.Add(new SourceItemHeader("网络相机"));
-            var cameras = _network.ListCameras(out var netDiag);
+            var cameras = _server.ListCameras(out var netDiag);
             foreach (var line in netDiag)
             {
-                Log($"[网络] {line}");
+                Log($"[服务器] {line}");
             }
 
             if (cameras.Count == 0)
             {
                 _sourceCombo.Items.Add(new SourceItemPlaceholder(
-                    _network.LastError is { Length: > 0 } err
+                    _server.LastError is { Length: > 0 } err
                         ? $"（{err}）"
-                        : "（无网络相机）"));
+                        : "（暂无 agent 推流）"));
             }
             else
             {
-                int skipped = 0;
-
-                // 在线优先：服务端返回的顺序按创建时间，最新建的排最前，
-                // 而测试期建的多是离线相机 → 用户一进界面默认选中的就是死的。
-                // 按「在线优先、同组内保持服务端原序」重排，避免默认踩坑。
-                var ordered = cameras
-                    .OrderByDescending(c => c.IsOnline)
-                    .ToList();
-
-                int onlineCount = ordered.Count(c => c.IsOnline);
-                Log($"[网络] 在线 {onlineCount} / 共 {ordered.Count} 个相机");
-
-                foreach (var c in ordered)
+                foreach (var item in cameras)
                 {
-                    var item = _network.ToSourceItem(c);
-                    if (item is not null)
-                    {
-                        _sourceCombo.Items.Add(item);
-                    }
-                    else
-                    {
-                        skipped++;
-                        Log($"[网络] 相机 {c.Id} 无可用播放地址（rtsp_url 与 stream_path 均缺失），已跳过");
-                    }
-                }
-
-                if (skipped > 0)
-                {
-                    _sourceCombo.Items.Add(new SourceItemPlaceholder($"（{skipped} 个相机无播放地址）"));
+                    _sourceCombo.Items.Add(item);
                 }
             }
 
@@ -633,6 +646,18 @@ internal sealed class MainForm : Form
     {
         _sourceKindLabel.Text = item.Kind == SourceKind.NetworkCamera ? "源: 网络相机" : "源: 本地文件";
 
+        // 直播源（网络相机 / RTSP）没有固定时长，必须按“到达即呈现”处理。
+        //
+        // 若仍按时间戳节流：DecodeLoop 会计算 expectedMs = presented * frameInterval，
+        // 而网络源的首帧等待时间远大于一帧间隔（握手 + 关键帧），于是
+        // actualMs 一路领先 → waitMs < -200 恒成立 → 每一帧都被判定“落后太多”
+        // 而 Dispose + continue，RaiseFrameReady 永不触发，画布永远停在占位符，
+        // 但 IsPlaying 仍为 true（状态栏显示“播放中”）。
+        // 症状极具误导性：日志有“[播放] 开始”，却没有任何帧、也没有错误。
+        //
+        // 本地文件仍保留节流（避免全速解码后瞬间丢帧）。
+        _player.ThrottleByTimestamp = item.Kind != SourceKind.NetworkCamera;
+
         if (!_player.Play(item.Input))
         {
             SetStatus("打开失败");
@@ -674,11 +699,12 @@ internal sealed class MainForm : Form
             return;
         }
 
-        // 先读取服务端当前模式，使下拉框与真实状态一致
-        string? mode = _network.GetAiMode(item.CameraId);
+        // 先读取本端维护的当前模式，使下拉框与真实状态一致
+        // （这个值就是 agent 下次轮询 aimode 会拿到的那个，两侧天然一致）
+        string? mode = _server.GetAiMode(item.CameraId);
         if (mode is not null)
         {
-            Log($"[AI] 服务端当前模式: {mode}");
+            Log($"[AI] 服务器当前模式: {mode}");
             SelectAiModeInCombo(mode);
             _selectedAiMode = mode;
             _aiOverlayVisible = !string.Equals(mode, "ai-off", StringComparison.Ordinal);
@@ -695,9 +721,7 @@ internal sealed class MainForm : Form
                 string.Equals(m.Id, mode, StringComparison.Ordinal))
             {
                 // 直接赋值会触发 OnAiModeChanged 再下发一次；此处用标志抑制
-                _suppressAiModeEvent = true;
-                _aiModeCombo.SelectedIndex = i;
-                _suppressAiModeEvent = false;
+                SetAiModeComboIndex(i);
                 return;
             }
         }
@@ -869,14 +893,14 @@ internal sealed class MainForm : Form
 
         Log($"[AI] 下发模式 → {mode.Id}（相机 {cameraId}）");
 
-        if (!_network.SetAiMode(cameraId, mode.Id))
+        if (!_server.SetAiMode(cameraId, mode.Id))
         {
-            Log($"[AI] 模式下发失败: {_network.LastError}");
-            SetStatus($"AI 模式下发失败：{_network.LastError}");
+            Log($"[AI] 模式下发失败（相机 {cameraId} 非法模式或服务器未启动）");
+            SetStatus($"AI 模式下发失败：{mode.Id}");
             return;
         }
 
-        Log($"[AI] 模式已下发: {mode.Id}");
+        Log($"[AI] 模式已下发: {mode.Id}（agent 将在 ≤2s 内轮询到）");
     }
 
     /// <summary>
@@ -897,6 +921,17 @@ internal sealed class MainForm : Form
     /// <summary>
     /// 根据当前源更新 AI 模式下拉的可用性。
     /// <para>本地摄像头不支持 AI（需求 4 明确要求），必须置灰。</para>
+    /// <para>
+    /// <b>这里的选择动作必须抑制事件。</b>本方法是"把下拉框调整到与当前源相称的
+    /// 状态"，属于 UI 回填，不是用户点选；一旦让 SelectedIndex 变化冒泡到
+    /// <see cref="OnAiModeChanged"/>，就会把默认项当成用户命令真下发给 agent。
+    /// </para>
+    /// <para>
+    /// 实测过的故障链：切换源 → 本方法把 SelectedIndex 从 -1 置为 0（ai-off）
+    /// → OnAiModeChanged 走 SetAiMode 直写 <c>DesiredAiMode</c>（走的是
+    /// 进程内 ServerHost.SetAiMode，**不经过 HTTP，所以任何服务端日志都看不到**）
+    /// → agent 下一次 2s 轮询读到 ai-off。表现是"用户什么都没点，AI 却自己关了"。
+    /// </para>
     /// </summary>
     private void UpdateAiModeAvailability(SourceItem? item)
     {
@@ -907,7 +942,7 @@ internal sealed class MainForm : Form
         if (!supported)
         {
             // 置灰的同时清空选择，避免看起来「选了但没生效」
-            _aiModeCombo.SelectedIndex = -1;
+            SetAiModeComboIndex(-1);
             return;
         }
 
@@ -918,7 +953,25 @@ internal sealed class MainForm : Form
 
         if (_aiModeCombo.SelectedIndex < 0 && _aiModeCombo.Items.Count > 0)
         {
-            _aiModeCombo.SelectedIndex = 0;
+            SetAiModeComboIndex(0);
+        }
+    }
+
+    /// <summary>
+    /// 程序化设置 AI 模式下拉的选中项，并抑制随之而来的
+    /// <see cref="OnAiModeChanged"/>——调用方若真想下发模式，必须显式调用
+    /// <see cref="ServerHost.SetAiMode"/>，不能依赖事件副作用。
+    /// </summary>
+    private void SetAiModeComboIndex(int index)
+    {
+        _suppressAiModeEvent = true;
+        try
+        {
+            _aiModeCombo.SelectedIndex = index;
+        }
+        finally
+        {
+            _suppressAiModeEvent = false;
         }
     }
 
@@ -971,18 +1024,81 @@ internal sealed class MainForm : Form
         Log($"ffmpeg 运行库   : {FFmpegLoader.ResolvedDirectory}");
         Log($"ffmpeg 版本     : {FFmpegLoader.VersionInfo}");
         Log($"硬解探测        : {FFmpegLoader.DescribeAvailableHwaccels()}");
-        Log($"video-server    : {_network.BaseUrl}");
+        Log($"内嵌服务器      : {_server.RtspBase}（RTSP 接收 agent 推流）");
+        Log($"metadata 端点   : {_server.MetadataUrl}");
         Log($"系统            : {Environment.OSVersion} / {(Environment.Is64BitProcess ? "x64" : "x86")}");
         Log("=== 自检结束 ===");
+    }
+
+    /// <summary>
+    /// 接线内嵌服务器：启动它，并把"相机列表变化"事件搬回 UI 线程刷新下拉框。
+    /// </summary>
+    private void WireServer()
+    {
+        // CamerasChanged 由 MediaMTX 路径轮询线程 / HttpListener 线程触发，
+        // 必须 BeginInvoke 回 UI 线程后才能碰控件。
+        _server.CamerasChanged += () =>
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            if (InvokeRequired)
+            {
+                BeginInvoke(RefreshServerStatus);
+                return;
+            }
+
+            RefreshServerStatus();
+        };
+
+        if (_server.Start(Log))
+        {
+            SetServerLabel(ok: true);
+            Log($"[服务器] agent 推流地址: {_server.RtspBase}/<camera_id>");
+            Log($"[服务器] agent 的 --metadata-url: {_server.MetadataUrl}");
+        }
+        else
+        {
+            SetServerLabel(ok: false);
+            Log($"[服务器] 启动失败: {_server.LastError}");
+            Log("[服务器] 本地文件播放与本地摄像头不受影响，但网络相机不可用。");
+        }
+    }
+
+    private void SetServerLabel(bool ok)
+    {
+        _serverLabel.Text = ok ? "服务器: 运行中" : "服务器: 未启动";
+        _serverLabel.ForeColor = ok ? Color.FromArgb(120, 200, 120) : Color.FromArgb(220, 140, 120);
+    }
+
+    /// <summary>刷新服务器状态标签上的相机计数。</summary>
+    private void RefreshServerStatus()
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        var cameras = _server.ListCameras(out _);
+        int online = cameras.Count(c => c.IsOnline);
+        _serverLabel.Text = _server.IsRunning
+            ? $"服务器: 运行中 ({online}/{cameras.Count} 在线)"
+            : "服务器: 未启动";
+        _serverLabel.ForeColor = _server.IsRunning
+            ? Color.FromArgb(120, 200, 120)
+            : Color.FromArgb(220, 140, 120);
     }
 
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
+            _aiPoller.Dispose();
             _player.Dispose();
             _camera.Dispose();
-            _network.Dispose();
+            _server.Dispose();
             _canvas.Dispose();
         }
 

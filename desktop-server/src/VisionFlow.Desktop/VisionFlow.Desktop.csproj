@@ -78,4 +78,29 @@
     <Message Importance="high" Text="[FFmpeg] 已复制 @(FFmpegDll->Count()) 个运行库 → $(OutDir)" />
   </Target>
 
+  <!-- 内嵌 MediaMTX：desktop-server 作为独立视频服务器时自行托管它。
+       仓库里放一份副本（mediamtx/mediamtx.exe，55 MB，gitignore 排除），
+       构建时拷到输出目录，使 exe 可以直接运行、无需安装到 PATH。
+       缺失不是构建错误：没这份副本时仍可本地播放文件/摄像头，
+       只有"作为服务器接收 agent 推流"会不可用，运行时给出提示即可。 -->
+  <PropertyGroup>
+    <MediaMtxSourceDir>$(MSBuildProjectDirectory)\..\..\mediamtx</MediaMtxSourceDir>
+  </PropertyGroup>
+
+  <Target Name="CopyMediaMtxRuntime" AfterTargets="Build"
+          Condition="Exists('$(MediaMtxSourceDir)\mediamtx.exe')">
+    <ItemGroup>
+      <MediaMtxFiles Include="$(MediaMtxSourceDir)\mediamtx.exe" />
+      <MediaMtxFiles Include="$(MediaMtxSourceDir)\LICENSE" Condition="Exists('$(MediaMtxSourceDir)\LICENSE')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(MediaMtxFiles)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="[MediaMTX] 已复制内嵌服务器 → $(OutDir)" />
+  </Target>
+
+  <Target Name="WarnMediaMtxMissing" AfterTargets="Build"
+          Condition="!Exists('$(MediaMtxSourceDir)\mediamtx.exe')">
+    <Message Importance="high"
+             Text="[MediaMTX] 未找到 $(MediaMtxSourceDir)\mediamtx.exe —— 内嵌服务器功能不可用（本地文件/摄像头播放不受影响）" />
+  </Target>
+
 </Project>

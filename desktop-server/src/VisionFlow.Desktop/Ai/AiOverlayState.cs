@@ -1,4 +1,4 @@
-using VisionFlow.Desktop.Network;
+using VisionFlow.Desktop.Server;
 
 namespace VisionFlow.Desktop.Ai;
 
@@ -31,7 +31,7 @@ internal sealed class AiOverlayState
     public string? AiMode { get; init; }
 
     /// <summary>检测目标列表。</summary>
-    public IReadOnlyList<ObjectViewDto> Objects { get; init; } = [];
+    public IReadOnlyList<MetadataObject> Objects { get; init; } = [];
 
     /// <summary>AI 是否在运行（来自心跳）。</summary>
     public bool Running { get; init; }
@@ -56,16 +56,22 @@ internal sealed class AiOverlayState
         => DateTimeOffset.Now - FetchedAt > threshold;
 
     /// <summary>
-    /// 从服务端快照构造。
+    /// 从服务器侧的相机状态构造。
+    ///
+    /// <para>
+    /// 注意 <paramref name="state"/> 的两半来自不同通道且可独立缺失：
+    /// <c>LastFrame</c> 只有 AI 在跑才有，<c>LastStatus</c> 是心跳（AI 关闭时
+    /// agent 仍会发）。因此这里对两者分别做空值兜底，而不是假定"有帧就有心跳"。
+    /// </para>
     /// </summary>
-    public static AiOverlayState FromSnapshot(string cameraId, SnapshotDto snap)
+    public static AiOverlayState FromCameraState(CameraState state)
     {
-        var frame = snap.Frame;
-        var status = snap.Status;
+        var frame = state.LastFrame;
+        var status = state.LastStatus;
 
         return new AiOverlayState
         {
-            CameraId = cameraId,
+            CameraId = state.CameraId,
             FrameId = frame?.FrameId ?? 0,
             Timestamp = frame?.Timestamp ?? 0,
             VideoWidth = frame?.VideoWidth ?? 0,
@@ -77,7 +83,9 @@ internal sealed class AiOverlayState
             Model = status?.Model,
             Tracker = status?.Tracker,
             Processed = status?.Processed ?? 0,
-            FetchedAt = DateTimeOffset.Now,
+            FetchedAt = state.LastMetadataAt == default
+                ? DateTimeOffset.Now.AddDays(-1)
+                : state.LastMetadataAt,
         };
     }
 }

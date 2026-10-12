@@ -2,7 +2,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using VisionFlow.Desktop.Ai;
 using VisionFlow.Desktop.Decoding;
-using VisionFlow.Desktop.Network;
+using VisionFlow.Desktop.Server;
 using VisionFlow.Desktop.Rendering;
 
 namespace VisionFlow.Desktop;
@@ -256,7 +256,7 @@ internal static class RealFrameOverlayProbe
             AiMode = "ai-y-pose",
             Objects =
             [
-                new ObjectViewDto
+                new MetadataObject
                 {
                     Class = "person",
                     Confidence = 0.91,
