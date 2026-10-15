@@ -52,6 +52,20 @@ internal sealed class MainForm : Form
     private readonly ToolStripStatusLabel _sourceKindLabel = new();
     private readonly ToolStripStatusLabel _serverLabel = new();
 
+    // ── 播放进度 / 音量（仅本地视频文件可用）──
+    private readonly TrackBar _progressBar = new();
+    private readonly Label _timeCurrent = new();
+    private readonly Label _timeTotal = new();
+    private readonly Label _volumeLabel = new();
+    private readonly TrackBar _volumeBar = new();
+    private readonly System.Windows.Forms.Timer _mediaTimer = new();
+
+    /// <summary>用户正在拖动进度条，临时挂起定时刷新以免互相打架。</summary>
+    private bool _seeking;
+
+    /// <summary>抑制程序化赋值时触发的音量事件（避免源切换时刷日志）。</summary>
+    private bool _suppressVolumeEvent;
+
     private readonly PlayerController _player = new();
     private readonly CameraPreviewController _camera = new();
 
@@ -105,6 +119,8 @@ internal sealed class MainForm : Form
         _stopButton.Click += OnStop;
         _sourceCombo.SelectedIndexChanged += OnSourceChanged;
         _canvas.OverlayDraw += OnOverlayDraw;
+
+        WireMediaControls();
 
         RunEnvironmentSelfCheck();
 
@@ -181,9 +197,9 @@ internal sealed class MainForm : Form
         var topPanel = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
-            Height = 88,
+            Height = 126,
             ColumnCount = 8,
-            RowCount = 2,
+            RowCount = 3,
             Padding = new Padding(8, 6, 8, 6),
         };
         topPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
@@ -194,6 +210,7 @@ internal sealed class MainForm : Form
         topPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
         topPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 160));
         topPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 60));
+        topPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         topPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         topPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
 
@@ -249,6 +266,62 @@ internal sealed class MainForm : Form
 
         topPanel.Controls.Add(controlRow, 1, 1);
         topPanel.SetColumnSpan(controlRow, 7);
+
+        // ── 第三行：进度条 + 音量（仅本地视频文件可用；摄像头/网络相机禁用）──
+        var mediaBar = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 6,
+            RowCount = 1,
+            Margin = new Padding(0),
+        };
+        mediaBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 54));   // 当前时间
+        mediaBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));   // 进度条
+        mediaBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 54));   // 总时长
+        mediaBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 12));   // 间隔
+        mediaBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 38));   // 音量标签
+        mediaBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100));  // 音量滑块
+        mediaBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+
+        _timeCurrent.Text = "00:00";
+        _timeCurrent.TextAlign = ContentAlignment.MiddleCenter;
+        _timeCurrent.Dock = DockStyle.Fill;
+        _timeCurrent.Margin = new Padding(0);
+        mediaBar.Controls.Add(_timeCurrent, 0, 0);
+
+        _progressBar.Dock = DockStyle.Fill;
+        _progressBar.Minimum = 0;
+        _progressBar.Maximum = 1000;
+        _progressBar.TickStyle = TickStyle.None;
+        _progressBar.Enabled = false;
+        _progressBar.Margin = new Padding(4, 9, 4, 9);
+        mediaBar.Controls.Add(_progressBar, 1, 0);
+
+        _timeTotal.Text = "00:00";
+        _timeTotal.TextAlign = ContentAlignment.MiddleCenter;
+        _timeTotal.Dock = DockStyle.Fill;
+        _timeTotal.Margin = new Padding(0);
+        mediaBar.Controls.Add(_timeTotal, 2, 0);
+
+        mediaBar.Controls.Add(new Panel { Dock = DockStyle.Fill }, 3, 0);
+
+        _volumeLabel.Text = "音量";
+        _volumeLabel.TextAlign = ContentAlignment.MiddleCenter;
+        _volumeLabel.Dock = DockStyle.Fill;
+        _volumeLabel.Margin = new Padding(0);
+        mediaBar.Controls.Add(_volumeLabel, 4, 0);
+
+        _volumeBar.Dock = DockStyle.Fill;
+        _volumeBar.Minimum = 0;
+        _volumeBar.Maximum = 100;
+        _volumeBar.Value = 100;
+        _volumeBar.TickStyle = TickStyle.None;
+        _volumeBar.Enabled = false;
+        _volumeBar.Margin = new Padding(4, 9, 4, 9);
+        mediaBar.Controls.Add(_volumeBar, 5, 0);
+
+        topPanel.Controls.Add(mediaBar, 0, 2);
+        topPanel.SetColumnSpan(mediaBar, 8);
 
         // ── 画面 + 日志 ─────────────────────────────────────────────
         var split = new SplitContainer
@@ -306,7 +379,7 @@ internal sealed class MainForm : Form
         _player.Log += Log;
         _player.FrameReady += SubmitFrame;
         _player.PlayingChanged += OnPlayerPlayingChanged;
-        _player.Ended += () => SetStatus("播放结束");
+        _player.Ended += OnPlayerEnded;
 
         _camera.Log += Log;
         _camera.FrameReady += SubmitFrame;
@@ -613,6 +686,9 @@ internal sealed class MainForm : Form
 
         UpdateAiModeAvailability(item);
 
+        // 进度条/音量：仅本地视频文件可用；摄像头、网络相机一律禁用
+        UpdateMediaControlsForSource(item);
+
         // 网络相机：启动 AI 数据轮询
         if (item.Kind == SourceKind.NetworkCamera)
         {
@@ -759,8 +835,183 @@ internal sealed class MainForm : Form
         _backendLabel.Text = "后端: -";
         _sourceKindLabel.Text = "源: -";
         UpdateAiModeAvailability(null);
+        UpdateMediaControlsForSource(null);
         SetStatus("已停止");
         _current = null;
+    }
+
+    // ── 进度条 / 音量（仅本地视频文件）────────────────────────────────
+
+    /// <summary>接线进度条与音量的事件（控件已在 BuildLayout 创建）。</summary>
+    private void WireMediaControls()
+    {
+        _mediaTimer.Interval = 200;
+        _mediaTimer.Tick += (_, _) => OnMediaTick();
+
+        // 拖动期间挂起定时刷新，松手后再跳转，避免「定时器回写」与「用户拖拽」打架
+        _progressBar.MouseDown += (_, _) => _seeking = true;
+        _progressBar.Scroll += (_, _) => PreviewSeek();   // 拖动时实时预览时间
+        _progressBar.MouseUp += (_, _) => CommitSeek();
+        _progressBar.KeyUp += (_, _) => CommitSeek();      // 键盘左右键调进度
+
+        _volumeBar.ValueChanged += OnVolumeChanged;
+    }
+
+    /// <summary>
+    /// 按当前源切换进度条/音量的可用性并复位显示。
+    /// 仅 <see cref="SourceKind.LocalFile"/> 启用；本地摄像头、网络相机均禁用。
+    /// </summary>
+    private void UpdateMediaControlsForSource(SourceItem? item)
+    {
+        bool isLocalFile = item?.Kind == SourceKind.LocalFile;
+
+        _progressBar.Enabled = isLocalFile;
+        _volumeBar.Enabled = isLocalFile;
+
+        if (isLocalFile)
+        {
+            // 复位音量滑块到已暂存的音量（不触发日志）
+            _suppressVolumeEvent = true;
+            try
+            {
+                _volumeBar.Value = (int)Math.Round(_player.Volume * 100);
+            }
+            finally
+            {
+                _suppressVolumeEvent = false;
+            }
+
+            var dec = _player.Decoder;
+            _timeTotal.Text = dec is not null && dec.DurationSeconds > 0
+                ? FormatTime(dec.DurationSeconds)
+                : "00:00";
+            _timeCurrent.Text = "00:00";
+            _progressBar.Value = 0;
+
+            _mediaTimer.Start();
+        }
+        else
+        {
+            _mediaTimer.Stop();
+            _progressBar.Value = 0;
+            _timeCurrent.Text = "00:00";
+            _timeTotal.Text = "00:00";
+        }
+    }
+
+    /// <summary>定时刷新进度（UI 线程的 WinForms Timer）。</summary>
+    private void OnMediaTick()
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        if (_current?.Kind != SourceKind.LocalFile)
+        {
+            return;
+        }
+
+        var dec = _player.Decoder;
+        if (dec is null)
+        {
+            return;
+        }
+
+        double dur = dec.DurationSeconds;
+        if (dur <= 0)
+        {
+            return;
+        }
+
+        if (_seeking)
+        {
+            return;
+        }
+
+        double pos = _player.PositionSeconds;
+        int v = (int)Math.Clamp(pos / dur * 1000, 0, 1000);
+        if (_progressBar.Value != v)
+        {
+            _progressBar.Value = v;
+        }
+
+        _timeCurrent.Text = FormatTime(pos);
+        _timeTotal.Text = FormatTime(dur);
+    }
+
+    /// <summary>拖动进度条时实时预览当前时间（不真正跳转）。</summary>
+    private void PreviewSeek()
+    {
+        if (_current?.Kind != SourceKind.LocalFile || !_seeking)
+        {
+            return;
+        }
+
+        var dec = _player.Decoder;
+        if (dec is null || dec.DurationSeconds <= 0)
+        {
+            return;
+        }
+
+        double pos = _progressBar.Value / 1000.0 * dec.DurationSeconds;
+        _timeCurrent.Text = FormatTime(pos);
+    }
+
+    /// <summary>松手/按键结束拖动后，真正执行跳转。</summary>
+    private void CommitSeek()
+    {
+        _seeking = false;
+
+        if (_current?.Kind != SourceKind.LocalFile)
+        {
+            return;
+        }
+
+        var dec = _player.Decoder;
+        if (dec is null || dec.DurationSeconds <= 0)
+        {
+            return;
+        }
+
+        double pos = _progressBar.Value / 1000.0 * dec.DurationSeconds;
+        _player.Seek(pos);
+        _timeCurrent.Text = FormatTime(pos);
+    }
+
+    /// <summary>音量变化：仅暂存到 <see cref="PlayerController.Volume"/>（音频后端未接入）。</summary>
+    private void OnVolumeChanged(object? sender, EventArgs e)
+    {
+        if (_suppressVolumeEvent)
+        {
+            return;
+        }
+
+        double v = _volumeBar.Value / 100.0;
+        _player.Volume = v;
+        Log($"[音量] 滑块 = {_volumeBar.Value}%（占位：音频后端未接入，值已暂存，待音频链路补全后生效）");
+    }
+
+    /// <summary>本地文件播放自然结束：复位进度显示。</summary>
+    private void OnPlayerEnded()
+    {
+        SetStatus("播放结束");
+        if (_current?.Kind == SourceKind.LocalFile)
+        {
+            _progressBar.Value = 0;
+            _timeCurrent.Text = "00:00";
+        }
+    }
+
+    private static string FormatTime(double seconds)
+    {
+        if (seconds < 0 || double.IsNaN(seconds) || double.IsInfinity(seconds))
+        {
+            seconds = 0;
+        }
+
+        var t = TimeSpan.FromSeconds(seconds);
+        return t.Hours > 0 ? t.ToString(@"h\:mm\:ss") : t.ToString(@"mm\:ss");
     }
 
     // ── AI 叠加（阶段 5）────────────────────────────────────────────
@@ -1096,6 +1347,8 @@ internal sealed class MainForm : Form
         if (disposing)
         {
             _aiPoller.Dispose();
+            _mediaTimer.Stop();
+            _mediaTimer.Dispose();
             _player.Dispose();
             _camera.Dispose();
             _server.Dispose();

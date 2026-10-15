@@ -45,8 +45,23 @@ internal sealed class PlayerController : IDisposable
     /// <summary>是否按时间戳节流（本地文件为 true；直播源为 false，全速解码）。</summary>
     public bool ThrottleByTimestamp { get; set; } = true;
 
+    /// <summary>
+    /// 音量（0~1）。<b>占位属性</b>：当前应用没有音频后端（只解码视频流），
+    /// 该值仅暂存，供后续音频链路接入后直接驱动播放增益，无需改 UI。
+    /// </summary>
+    public double Volume { get; set; } = 1.0;
+
     /// <summary>当前播放位置（秒）。</summary>
     public double PositionSeconds { get; private set; }
+
+    /// <summary>已呈现帧的单调计数（用于把进度条定位到 seek 之后的相对位置）。</summary>
+    private long _presentedCount;
+
+    /// <summary>seek 基准：基准帧计数对应的绝对秒数。</summary>
+    private long _seekBasePresented;
+
+    /// <summary>seek 基准：绝对秒数。PositionSeconds = 基准秒数 + (已呈现 - 基准帧)/帧率。</summary>
+    private double _seekBaseSeconds;
 
     /// <summary>
     /// 打开输入并开始播放。会先停掉当前播放。
@@ -73,6 +88,11 @@ internal sealed class PlayerController : IDisposable
             IsPlaying = true;
             PlayingChanged?.Invoke(true);
 
+            // 新一次播放：进度基准归零
+            _presentedCount = 0;
+            _seekBasePresented = 0;
+            _seekBaseSeconds = 0;
+
             _worker = new Thread(() => DecodeLoop(decoder, token))
             {
                 IsBackground = true,
@@ -89,7 +109,6 @@ internal sealed class PlayerController : IDisposable
         Log?.Invoke($"[播放] 开始，后端={decoder.Backend} 硬解尝试={HardwareEnabled}");
 
         var clock = Stopwatch.StartNew();
-        long presented = 0;
 
         try
         {
@@ -98,7 +117,7 @@ internal sealed class PlayerController : IDisposable
                 var frame = decoder.DecodeNextFrame();
                 if (frame is null)
                 {
-                    Log?.Invoke($"[播放] 解码结束，共 {presented} 帧");
+                    Log?.Invoke($"[播放] 解码结束，共 {_presentedCount} 帧");
                     break;
                 }
 
@@ -107,7 +126,7 @@ internal sealed class PlayerController : IDisposable
                 if (ThrottleByTimestamp && decoder.FrameRate > 1)
                 {
                     double frameIntervalMs = 1000.0 / decoder.FrameRate;
-                    double expectedMs = presented * frameIntervalMs;
+                    double expectedMs = _presentedCount * frameIntervalMs;
                     double actualMs = clock.Elapsed.TotalMilliseconds;
                     double waitMs = expectedMs - actualMs;
 
@@ -130,15 +149,17 @@ internal sealed class PlayerController : IDisposable
                     {
                         // 落后太多，直接跳帧追上（保持音画/实时语义）
                         frame.Dispose();
-                        presented++;
+                        _presentedCount++;
                         continue;
                     }
                 }
 
-                presented++;
+                _presentedCount++;
+                // 进度 = seek 基准秒数 +（已呈现帧 - 基准帧）/ 帧率。
+                // 这样 seek 之后进度条能正确停在跳转点并继续推进，而不是跳回旧位置。
                 PositionSeconds = decoder.FrameRate > 0
-                    ? presented / decoder.FrameRate
-                    : 0;
+                    ? _seekBaseSeconds + (_presentedCount - _seekBasePresented) / decoder.FrameRate
+                    : _seekBaseSeconds;
 
                 RaiseFrameReady(frame);
             }
@@ -204,6 +225,9 @@ internal sealed class PlayerController : IDisposable
             Decoder = null;
             IsPlaying = false;
             PositionSeconds = 0;
+            _presentedCount = 0;
+            _seekBasePresented = 0;
+            _seekBaseSeconds = 0;
         }
 
         PlayingChanged?.Invoke(false);
@@ -224,6 +248,11 @@ internal sealed class PlayerController : IDisposable
         }
 
         decoder.SeekTo(seconds);
+
+        // 把进度基准挪到跳转点：之后 PositionSeconds 以当前帧计数为基准继续累加，
+        // 否则下一帧会按旧帧计数回写、进度条跳回跳转前位置（拖动失效）。
+        _seekBaseSeconds = seconds;
+        _seekBasePresented = _presentedCount;
         PositionSeconds = seconds;
     }
 
